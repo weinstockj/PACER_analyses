@@ -1,0 +1,773 @@
+---
+title: "Finemapping the TCL1A region"
+author:
+  - name: Josh Weinstock
+date: "`r Sys.Date()`"
+output: 
+    distill::distill_article:
+        toc: true
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
+```
+
+```{r load, include=FALSE, cache = TRUE}
+library("tidyverse")
+library("glue")
+library("reticulate")
+
+chrom = "chr14"
+bcf_file = glue("/net/topmed2/working/gt-release/exchange-area/freeze.8/minDP0/freeze.8.{chrom}.pass_and_fail.gtonly.minDP0.bcf")
+csi_file = glue("{bcf_file}.csi")
+start = 95614358
+end = 95814358
+region = glue("{chrom}:{start}-{end}")
+use_python("$HOME/anaconda3/bin/python3.7")
+counts = data.table::fread("../output/csv/estimated_clone_expansions_encore_2020_09_02.tsv") %>% 
+    as_tibble %>%
+    dplyr::mutate(VAF = alt_reads / (ref_reads + alt_reads))
+
+sample_manifest = data.table::fread("../../chip_call_set/output/TOPMed_CHIPcalls_with_covariates_2020_08_31.tsv.gz") %>%
+    as_tibble
+
+load("/net/topmed3/working/anitapan/freeze.8/relatedness/pcair_results.RData")
+ids = rownames(pca$vectors)
+pca = as_tibble(pca$vectors) %>% 
+    setNames(glue::glue("PC{1:11}")) %>%
+    mutate(NWD_ID = ids)
+counts = counts %>%
+    inner_join(pca)
+
+global_ancestry = data.table::fread("../../../gt-release/exchange-area/freeze.6a.local.ancestry/freeze.6a.global.ancestry.txt") %>%
+    setNames(c("NWD_ID", 'sub-saharan africa', 'central and south asia', 'east asia', 'europe', 'native america', 'oceania', 'middle east', 'pi', 'stage')) %>%
+    as_tibble %>%
+    dplyr::select(-pi, -stage)
+
+global_ancestry_labels = global_ancestry %>% 
+    tidyr::gather(ancestry, proportion, -NWD_ID) %>%
+    dplyr::group_by(NWD_ID) %>%
+    dplyr::filter(proportion == max(proportion)) %>%
+    dplyr::ungroup(.)
+    
+```
+
+```{r, cache = TRUE}
+exclude_controls = function(df) {
+    df %>%
+        filter(haschip == 1)
+}
+
+exclude_samples_with_multiple_drivers = function(df) {
+    df %>%
+        filter(n_CHIP_variants == 1 | is.na(n_CHIP_variants))
+}
+
+```
+
+```{python parse, cache = TRUE}
+import cyvcf2 as cyvcf
+import numpy as np
+import pandas as pd
+bcf = "tcl1a_genotypes/tcl1a.freeze8.pass.bcf"
+
+reader = cyvcf.VCF(bcf, gts012 = True, samples = r.counts.NWD_ID.values.tolist())
+variants = []
+
+samples = reader.samples
+
+AC_THRESHOLD = 5
+
+gt_list = []
+chrom_list = []
+pos_list = []
+ref_list = []
+alt_list = []
+ac_list = []
+af_list = []
+for v in reader(r.region):
+    AC = v.INFO.get("AC")
+    gt = v.gt_types.astype(np.int8)
+    if AC >= AC_THRESHOLD and np.sum(gt) >= AC_THRESHOLD:
+        chrom = v.CHROM
+        pos = v.POS
+        ref = v.REF
+        alt = "".join(v.ALT)
+        ac_list.append(AC)
+        af_list.append(v.INFO.get("AF"))
+        variants.append(f"{chrom}-{pos}-{ref}-{alt}")
+        gt_list.append(gt)
+
+        chrom_list.append(chrom)
+        pos_list.append(pos)
+        ref_list.append(ref)
+        alt_list.append(alt)
+
+variant_meta = pd.DataFrame({
+    "CHROM" : chrom_list,
+    "POS"   : pos_list,
+    "REF"   : ref_list,
+    "ALT"   : alt_list,
+    "AC"    : ac_list,
+    "AF"    : af_list,
+    "ID"    : variants
+})
+genotypes = np.vstack(gt_list)
+```
+
+```{r conv, cache = TRUE}
+library("Matrix")
+genotypes = t(py$genotypes)
+colnames(genotypes) = py$variants
+rownames(genotypes) = py$samples
+#saveRDS(genotypes, file = "parsed_tcl1a_gt.Rds")
+#genotypes = readRDS("parsed_tcl1a_gt.Rds")
+sparse_genotypes = Matrix::Matrix(genotypes, sparse = TRUE)
+ld = coop::pcor(genotypes)
+ld2 = ld ^ 2
+variant_meta = tibble::as_tibble(py$variant_meta)
+```
+## Summary
+
+### Results
+
+#### Finemapping
+
+We used SuSiE [1] to finemap a 200kb region surrounding TCL1A (95614358 - 95814358) using the following combinations of covariates:
+    
+    1. 10 genetic ancestry PCs  
+    2. 10 genetic ancestry PCs + age
+    3. 10 genetic ancestry PCs + age + VAF
+
+To adjust for the covariates, we regressed the singleton counts directly on the covariates
+and applied an inverse normal transform to the residuals. We included all variants that had a MAC >= 5 in the
+analyzed samples. In each of the three models, SuSiE identified a credible set containing a single variant, rs2887399. In model 1) we also observed a second credible set with a weaker signal. 
+
+#### Rare variant analyses
+
+We asked whether a burden of rare variation was associated with singleton counts in the same TCL1A region. We used the 
+SCANG rare variant scan procedure [2] to estimate the association, including all
+variants with a MAC <= 300 (MAF <= 3.7%). The SCANG procedure estimates the association between rare variants
+in moving windows across the genome, and estimates the size of the windows. SCANG did not identify any regions
+at exome-wide significance (2.5e-06), though did identify one region within an order of magnitude 
+(pvalue = 6.6e-06, family-wise pvalue = 2e-03). After conditioning on the rs2887399 genotypes in the 
+rare variant analysis, the signal was attentuated, suggesting limited evidence for an independent rare-variant 
+signal from rs2887399.
+
+#### Interaction between rs2887399 and CHIP driver gene
+
+We asked whether the assocation between rs2887399 and residualized passenger counts was modified by
+CHIP driver gene. Using DNMT3A as the reference, we investigated whether other genes had different
+effect estimates for rs2887399. We observed that alt-allele dosage in rs2887399 was more protective in
+TET2 than DNMT3A (beta = -0.23, pvalue = 2e-03), but we were underpowered to detect effects in other genes. The 
+dosage was most protective in SF3B1 (beta = -0.30). 
+
+#### Interaction between rs2887399 and clone size
+
+We asked whether the association between rs2887399 and residualized passenger counts was modified by
+clone size. We estimated main effects for dosage of rs2887399, VAF z-scores, and an interaction term. We
+did not observe an association at the interaction term, suggesting that the effects of rs2887399 may
+be unaffected by clone size, although this effect may vary by driver gene.  
+
+### Association between genetic ancestry and singleton counts
+
+As the allele frequency of rs2887399 varies by population, we asked whether singleton count was associated
+with the first two genetic ancestry principal components. We observed a positive association between
+values on the PC1 axis with singleton counts. Even after conditioning on the rs2887399 dosage,
+the association remained. A linear regression with rs2887399 dosage and the first two principal components as
+covariates explained 4% of the variation in the inverse-normal transformed singleton counts. 
+
+### References
+
+ 1. A simple new approach to variable selection in regression, with application to genetic fine-mapping
+ Gao Wang, Abhishek Sarkar, Peter Carbonetto, Matthew Stephens
+ bioRxiv 501114; doi: https://doi.org/10.1101/501114  
+ 2. Li, Zilin, et al. "Dynamic Scan Procedure for Detecting Rare-Variant Association Regions in Whole-Genome Sequencing Studies." The American Journal of Human Genetics 104.5 (2019): 802-814.
+
+
+
+```{r finemap, cache = TRUE}
+library("susieR")
+inverse_normalize = function(x) {
+    # rank sorts in ascending order!
+    qnorm(rank(x, na.last = "keep") / (sum(!is.na(x)) + 1))
+}
+set.seed(1)
+
+fit_susie = function(phenotype, phenotype_string = "counts", sparse_genotypes, covariates) {
+    covariate_string = glue_collapse(covariates, " + ")
+    formula = as.formula(glue("{phenotype_string} ~ {covariate_string}"))
+
+    resids = residuals(lm(formula, phenotype))
+    susie_model = susie(
+        sparse_genotypes,
+        inverse_normalize(resids),
+        L = 10,
+        estimate_residual_variance = TRUE,
+        estimate_prior_variance = FALSE,
+        scaled_prior_variance = 0.1,
+        verbose = FALSE
+    )
+    susie_model
+}
+
+```
+
+```{r locus, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6}
+library("biomaRt")
+library("patchwork")
+
+get_rsid = function(chrom = "14", position) {
+    mart = useMart(
+                biomart = "ENSEMBL_MART_SNP", 
+                #path="/biomart/martservice",
+                dataset="hsapiens_snp"
+    )
+
+    getBM(
+        attributes = c('refsnp_id'),
+        filters = c('chr_name','start','end'),
+        values = list(chrom, position, position),
+        mart = mart
+    )
+}
+
+get_rsid = memoise::memoise(get_rsid)
+
+get_snp_to_gene = function(variant_meta) {
+    gene_bm = useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", GRCh = 38) 
+    
+    snp_to_gene = getBM(
+            attributes = c(
+                'start_position',
+                'end_position',
+                'ensembl_gene_id',
+                'external_gene_name', 
+                'gene_biotype',
+                'exon_chrom_start',
+                'exon_chrom_end'
+            ),
+            filters = c('chromosome_name','start','end'), 
+            values = list(
+                as.integer(stringr::str_replace(unique(variant_meta$CHROM), "chr", "")), # must be numeric
+                min(variant_meta$POS) + 1e3,
+                max(variant_meta$POS) - 1e3
+            ),
+            mart = gene_bm
+    )
+    return(snp_to_gene)
+}
+
+snp_to_gene = get_snp_to_gene(variant_meta)
+
+#valid_biotypes = c("lncRNA", "protein_coding")
+valid_biotypes = c("protein_coding")
+filter_biotype = . %>%
+    dplyr::filter(gene_biotype %in% valid_biotypes)
+
+interesting_snp_position = 95714358
+
+locuszoom = function(variant_meta, susie_model, ld2, interesting_snp_position, rsid, snp_to_gene) {
+
+    dfm = variant_meta
+    dfm$pip = susie_model$pip
+    dfm$ld2 = ld2[, variant_meta$POS == interesting_snp_position]
+
+    p1 = ggplot(data = dfm) +
+        scale_x_continuous(
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
+                expand = c(0, 1e4)
+        ) + 
+        scale_y_continuous(
+                labels = scales::percent,
+                limits = c(0, 1),
+                expand = c(.01, .01)
+        ) +
+    #    geom_hline(
+    #            yintercept = -log10(5e-8),
+    #            linetype = "dashed",
+    #            color = "gray"
+    #            ) + 
+    # geom_rect(
+    #     data = relevant_enhancer,
+    #     aes(xmin = start, xmax = end, ymin = 0, ymax = max(-log10(dfm$p.value))),
+    #     alpha = 0.1, 
+    #     fill = "red"
+    # ) + 
+        scale_fill_distiller(palette = "Spectral") + 
+        geom_point(
+                data = dfm, 
+                aes(x = POS, y = pip, fill = ld2),
+                color = "black", shape = 21, size = 1.5
+                ) +
+        geom_point(
+                data = dfm %>% filter(POS == interesting_snp_position), 
+                aes(x = POS, y = pip), 
+                shape = 24, 
+                color = "black", 
+                fill = "purple", 
+                size = 3
+                ) + 
+        ggtitle(glue("Highlighted point is {rsid} at {interesting_snp_position}")) +
+        labs(x = "position (Mb)", y = expression(PIP), fill = expression(r^{2})) +
+        cowplot::theme_cowplot() %+replace%
+        theme(
+                axis.title = element_text(size = 16),
+                plot.title = element_text(size = 17, vjust = 2),
+                axis.text = element_text(size = 14),
+                legend.key.width = unit(.5, "cm"),
+                legend.position = c(.9, .75),
+             ) 
+
+    p2 <- ggplot() + 
+        geom_linerange(aes(
+                    x = external_gene_name, 
+                    ymin = start_position, 
+                    ymax = end_position, 
+                ),
+            size = 1.5,
+            color = "darkblue",
+            data = snp_to_gene %>% filter_biotype %>% dplyr::select(start_position:gene_biotype) %>% distinct
+        ) +
+        geom_linerange(
+                aes(
+                    x = external_gene_name, 
+                    ymin = exon_chrom_start, 
+                    ymax = exon_chrom_end 
+                ),
+            size =  4,
+            color = "darkblue",
+            data = snp_to_gene %>% filter_biotype
+        ) +
+        coord_flip() + 
+        ylab("") +
+        scale_y_continuous(
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
+                limits = c(min(dfm$POS), max(dfm$POS)),
+                expand = c(0, 1e4)
+        ) +
+        geom_text(
+                aes(
+                    x = external_gene_name, 
+                    y = (start_position + end_position) / 2, 
+                    label = external_gene_name
+                ), 
+                fontface = 2, 
+                nudge_x = .4,
+                alpha = I(0.7), 
+                hjust = "center", 
+                size = 4.8,
+                data = snp_to_gene %>% filter_biotype %>% dplyr::select(start_position:gene_biotype) %>% distinct
+        ) + 
+        theme_void() 
+
+    p = p1 + p2 + plot_layout(ncol = 1, heights = c(5, 2))
+    p
+
+}
+```
+
+## Single variant analyses
+
+### Phenotype = residualized passenger counts, PCS as covariates
+
+```{r, cache = TRUE}
+susie_model_pcs = fit_susie(counts, "counts", sparse_genotypes, glue("PC{1:10}"))
+```
+
+```{r, cache = FALSE, layout="l-body-outset", fig.width=8, fig.height=6}
+interesting_snp_position = 95714358 
+locuszoom(
+    variant_meta,
+    susie_model_pcs, 
+    ld2,
+    interesting_snp_position,
+    "rs2887399",
+    snp_to_gene
+)
+```
+
+```{r, cache = FALSE, layout="l-body-outset", fig.width=8, fig.height=6}
+interesting_snp_position = 95714348 
+locuszoom(
+    variant_meta,
+    susie_model_pcs, 
+    ld2,
+    interesting_snp_position,
+    "rs11846938",
+    snp_to_gene
+)
+```
+
+### Phenotype = residualized passenger counts, PCS + age as covariates
+
+```{r, cache = TRUE}
+susie_model_pcs_age = fit_susie(counts, "counts", sparse_genotypes, c(glue("PC{1:10}"), "age"))
+```
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6}
+interesting_snp_position = 95714358 
+locuszoom(
+    variant_meta,
+    susie_model_pcs_age, 
+    ld2,
+    interesting_snp_position,
+    "rs2887399",
+    snp_to_gene
+)
+```
+### Phenotype = residualized passenger counts, PCS + age + VAF as covariates
+
+```{r, cache = TRUE}
+susie_model_pcs_age_vaf = fit_susie(counts, "counts", sparse_genotypes, c(glue("PC{1:10}"), "age", "VAF"))
+```
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6}
+interesting_snp_position = 95714358 
+locuszoom(
+    variant_meta,
+    susie_model_pcs_age_vaf, 
+    ld2,
+    interesting_snp_position,
+    "rs2887399",
+    snp_to_gene
+)
+```
+
+### Phenotype = residualized derived clone growth, PCS as covariates
+
+```{r, cache = TRUE, eval = FALSE}
+susie_model_pcs_derived = fit_susie(counts, "median_clone_growth", sparse_genotypes, c(glue("PC{1:10}")))
+```
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6, eval = FALSE}
+interesting_snp_position = 95714358 
+locuszoom(
+    variant_meta,
+    susie_model_pcs_derived, 
+    ld2,
+    interesting_snp_position,
+    "rs2887399",
+    snp_to_gene
+)
+```
+
+```{r, cache = TRUE, eval = FALSE}
+susie_model_pcs_derived2 = fit_susie(counts, "median_clone_growth", sparse_genotypes, c(glue("PC{1:10}")))
+```
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=8, fig.height=6, eval = FALSE}
+interesting_snp_position = 95714358 
+locuszoom(
+    variant_meta,
+    susie_model_pcs_derived2, 
+    ld2,
+    interesting_snp_position,
+    "rs2887399",
+    snp_to_gene
+)
+```
+
+```{r scang, cache = TRUE}
+library("SCANG")
+library("tictoc")
+
+set.seed(1)
+tic()
+
+attach_rs2887399 = function(phenotype, genotype) {
+    position = 95714358 
+    phenotype$rs2887399 = genotype[, variant_meta$POS == position]
+    return(phenotype)
+}
+
+
+attach_ivt_resids = function(phenotype, phenotype_string = "counts", covariates) {
+    covariate_string = glue_collapse(covariates, " + ")
+    formula = as.formula(glue("{phenotype_string} ~ {covariate_string}"))
+
+    resids = residuals(lm(formula, phenotype))
+    phenotype$ivt_resids = inverse_normalize(resids)
+    phenotype
+}
+
+
+fit_null = function(phenotype, phenotype_string, covariates) {
+    phenotype = attach_ivt_resids(phenotype, phenotype_string, covariates)
+
+    obj_nullmodel <- fit_null_glm_SCANG(ivt_resids ~ 1, data = phenotype, family=gaussian(link = "identity"))
+    return(obj_nullmodel)
+}
+
+obj_nullmodel = fit_null(counts, "counts", c(glue("PC{1:10}"), "age", "VAF"))
+res_lm <- SCANG(
+            sparse_genotypes, 
+            obj_nullmodel,
+            Lmin = 40,
+            Lmax = 200,
+            filter = 1e-4,
+            rare_maf_cutoff = .5 * 300 / nrow(counts),
+            f = .5
+        )
+
+toc()
+
+```
+```{r define_scang_plot}
+
+scangzoom = function(variant_meta, scang, snp_to_gene) {
+
+    dfm = variant_meta
+
+    rects = tibble::tibble(
+        start = dfm[scang$SCANG_O_res[, 2], ][["POS"]],
+        end = dfm[scang$SCANG_O_res[, 3], ][["POS"]],
+        ymin = rep(0, nrow(scang$SCANG_O_res)),
+        `-log10(pvalue)` = -log10(exp(-scang$SCANG_O_res[, 1]))
+    )
+
+    p1 = ggplot(data = dfm) +
+        geom_rect(
+            data = rects,
+            aes(xmin = start, xmax = end, ymin = ymin, ymax = `-log10(pvalue)`),
+            alpha = .3,
+            fill = "grey20"
+        ) +
+        scale_x_continuous(
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
+                limits = c(min(dfm$POS), max(dfm$POS)),
+                expand = c(0, 1e4)
+        ) + 
+        scale_y_continuous(
+                labels = scales::number
+        ) +
+        geom_hline(
+                yintercept = -log10(2.5e-06),
+                linetype = "dashed",
+                color = "gray"
+        ) + 
+        labs(x = "position (Mb)", y = expression(-log10(pvalue))) +
+        cowplot::theme_cowplot() %+replace%
+        theme(
+                axis.title = element_text(size = 16),
+                plot.title = element_text(size = 17, vjust = 2),
+                axis.text = element_text(size = 14),
+                legend.key.width = unit(.5, "cm"),
+                legend.position = c(.9, .75),
+             ) 
+
+    p2 <- ggplot() + 
+        geom_linerange(aes(
+                    x = external_gene_name, 
+                    ymin = start_position, 
+                    ymax = end_position, 
+                ),
+            size = 1.5,
+            color = "darkblue",
+            data = snp_to_gene %>% filter_biotype %>% dplyr::select(start_position:gene_biotype) %>% distinct
+        ) +
+        geom_linerange(
+                aes(
+                    x = external_gene_name, 
+                    ymin = exon_chrom_start, 
+                    ymax = exon_chrom_end 
+                ),
+            size =  4,
+            color = "darkblue",
+            data = snp_to_gene %>% filter_biotype
+        ) +
+        coord_flip() + 
+        ylab("") +
+        scale_y_continuous(
+                breaks = seq(min(dfm$POS), max(dfm$POS), length.out = 7),
+                labels = round(seq(min(dfm$POS), max(dfm$POS), length.out = 7) / 1e6, 2),
+                limits = c(min(dfm$POS), max(dfm$POS)),
+                expand = c(0, 1e4)
+        ) +
+        geom_text(
+                aes(
+                    x = external_gene_name, 
+                    y = (start_position + end_position) / 2, 
+                    label = external_gene_name
+                ), 
+                fontface = 2, 
+                nudge_x = .4,
+                alpha = I(0.7), 
+                hjust = "center", 
+                size = 4.8,
+                data = snp_to_gene %>% filter_biotype %>% dplyr::select(start_position:gene_biotype) %>% distinct
+        ) + 
+        theme_void() 
+
+    p = p1 + p2 + plot_layout(ncol = 1, heights = c(5, 2))
+    p
+}
+
+```
+
+## Rare variant analyses
+
+### Phenotype = residualized passenger counts, PCS + age + VAF as covariates
+
+```{r scangplot, cache = FALSE, layout="l-body-outset", fig.width=8, fig.height=6}
+scangzoom(variant_meta, res_lm, snp_to_gene)
+```
+### Phenotype = residualized passenger counts, PCS + age + VAF + rs2887399 as covariates
+
+```{r scang2, cache = TRUE}
+obj_nullmodel_with_snp = fit_null(
+    counts %>% attach_rs2887399(genotypes), 
+    "counts",
+    c(glue("PC{1:10}"), "age", "VAF", "rs2887399")
+)
+res_lm_with_snp <- SCANG(
+            sparse_genotypes, 
+            obj_nullmodel_with_snp,
+            Lmin = 40,
+            Lmax = 200,
+            filter = 5e-4,
+            rare_maf_cutoff = .5 * 300 / nrow(counts),
+            f = .5
+        )
+
+```
+
+```{r scangplot2, cache = FALSE, layout="l-body-outset", fig.width=8, fig.height=6}
+scangzoom(variant_meta, res_lm_with_snp, snp_to_gene)
+```
+
+## Interaction with driver gene
+
+### Phenotype = residualized passenger counts, PCS + age + VAF as covariates
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=6, fig.height=4, dpi = 300, dev = 'png'}
+top_genes = counts %>%
+    dplyr::count(chip_driver_gene, sort = TRUE) %>%
+    dplyr::slice(1:8) %>%
+    dplyr::pull(chip_driver_gene) 
+
+counts %>%
+    attach_rs2887399(genotypes) %>%
+    attach_ivt_resids("counts", c(glue("PC{1:10}"), "age", "VAF")) %>%
+    # filter(chip_driver_gene %in% top_genes) %>%
+    filter(chip_driver_gene %in% c("DNMT3A", "TET2")) %>%
+    inner_join(counts %>% dplyr::count(chip_driver_gene, name = "N")) %>%
+    mutate(gene_label = glue("{chip_driver_gene} (N = {N})")) %>%
+    ggplot(
+        data = .
+    ) +
+    geom_boxplot(aes(x = factor(rs2887399), y = ivt_resids), outlier.shape = NA) + 
+    geom_jitter(aes(x = factor(rs2887399), y = ivt_resids), width = 0.1, alpha = .03) +
+    geom_smooth(aes(x = factor(rs2887399), y = ivt_resids, group = 1), method = "lm") + 
+    labs(x = "rs2887399 genotype", y = "residualized passenger counts") + 
+    facet_wrap(~gene_label, nrow = 1) + 
+    cowplot::theme_cowplot(font_size = 12) +
+    cowplot::panel_border() 
+
+counts %>%
+    attach_rs2887399(genotypes) %>%
+    attach_ivt_resids("counts", c(glue("PC{1:10}"), "age", "VAF")) %>%
+    filter(chip_driver_gene %in% top_genes) %>%
+    mutate(chip_driver_gene = relevel(factor(chip_driver_gene), ref = "DNMT3A")) %>% 
+    lm(ivt_resids ~ chip_driver_gene * rs2887399, data = .) %>%
+    summary
+```
+
+### Phenotype = residualized VAF, PCS + age as covariates
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=10, fig.height=7, dpi = 300}
+counts %>%
+    attach_rs2887399(genotypes) %>%
+    attach_ivt_resids("VAF", c(glue("PC{1:10}"), "age")) %>%
+    dplyr::filter(chip_driver_gene %in% top_genes) %>%
+    dplyr::inner_join(counts %>% dplyr::count(chip_driver_gene, name = "N")) %>%
+    dplyr::mutate(gene_label = glue("{chip_driver_gene} (N = {N})")) %>%
+    ggplot(
+        data = .
+    ) +
+    geom_boxplot(aes(x = factor(rs2887399), y = ivt_resids), outlier.shape = NA) + 
+    geom_jitter(aes(x = factor(rs2887399), y = ivt_resids), width = 0.1, alpha = .03) +
+    geom_smooth(aes(x = factor(rs2887399), y = ivt_resids, group = 1), method = "lm") + 
+    labs(x = "rs2887399 genotype", y = "residualized VAF") + 
+    facet_wrap(~gene_label, nrow = 2) + 
+    cowplot::theme_cowplot() + 
+    cowplot::panel_border() 
+```
+### Phenotype = derived clone growth, PCS + age as covariates
+
+```{r, cache = TRUE, layout="l-body-outset", fig.width=10, fig.height=7, dpi = 300, eval = FALSE}
+counts %>%
+    attach_rs2887399(genotypes) %>%
+    attach_ivt_resids("median_clone_growth", c(glue("PC{1:10}"), "age")) %>%
+    dplyr::filter(chip_driver_gene %in% top_genes) %>%
+    dplyr::inner_join(counts %>% dplyr::count(chip_driver_gene, name = "N")) %>%
+    dplyr::mutate(gene_label = glue("{chip_driver_gene} (N = {N})")) %>%
+    ggplot(
+        data = .
+    ) +
+    geom_boxplot(aes(x = factor(rs2887399), y = ivt_resids), outlier.shape = NA) + 
+    geom_jitter(aes(x = factor(rs2887399), y = ivt_resids), width = 0.1, alpha = .03) +
+    geom_smooth(aes(x = factor(rs2887399), y = ivt_resids, group = 1), method = "lm") + 
+    labs(x = "rs2887399 genotype", y = "derived clone growth") + 
+    facet_wrap(~gene_label, nrow = 2) + 
+    cowplot::theme_cowplot() + 
+    cowplot::panel_border() 
+```
+
+## Association between singleton counts and ancestry
+
+```{r ancestry, cache = TRUE, fig.width=7, fig.height=5, dpi = 300}
+ggplot(data = counts, aes(x = PC1, y = PC2, color = inverse_normalize(counts))) +
+    geom_point(alpha = .1) + 
+    cowplot::theme_cowplot() + 
+    labs(color = "counts") +
+    viridis::scale_color_viridis()
+
+counts %>%
+    dplyr::inner_join(global_ancestry_labels) %>%
+    dplyr::group_by(ancestry) %>%
+    dplyr::filter(n() > 50) %>% # need 50 points to be plotted
+    dplyr::ungroup(.) %>%
+    ggplot(data = ., aes(x = inverse_normalize(counts), y = factor(ancestry), fill = factor(stat(quantile)))) +
+    ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE,
+            quantiles = 4, quantile_lines = TRUE
+    ) +
+    scale_fill_viridis_d(name = "quartiles") +
+    cowplot::theme_cowplot() + 
+    labs(x = "number of singletons", y = "RFMix genetic global ancestry")
+
+```
+
+```{r}
+lm(I(inverse_normalize(counts)) ~ PC1 + PC2 + rs2887399, data = counts %>% attach_rs2887399(genotypes)) %>%
+    summary
+```
+
+## Does clone size modify the association between rs2887399 and singleton count
+
+```{r}
+counts %>% 
+    attach_rs2887399(genotypes) %>% 
+    attach_ivt_resids("counts", c(glue("PC{1:10}"), "age")) %>%
+    lm(ivt_resids ~ rs2887399 * scale(VAF), data = .) %>% 
+    summary
+
+counts %>% 
+    attach_rs2887399(genotypes) %>% 
+    attach_ivt_resids("counts", c(glue("PC{1:10}"), "age")) %>%
+    mutate(VAF_quartile = ntile(VAF, 4)) %>%
+    ggplot(data = ., aes(x = rs2887399, y = ivt_resids)) +
+        geom_boxplot(aes(x = factor(rs2887399), y = ivt_resids), outlier.shape = NA) + 
+        geom_jitter(aes(x = factor(rs2887399), y = ivt_resids), width = 0.1, alpha = .03) +
+        geom_smooth(aes(x = factor(rs2887399), y = ivt_resids, group = 1), method = "lm") + 
+        cowplot::theme_cowplot() + 
+        cowplot::panel_border() +
+        labs(y = "residualized singleton counts") +
+        ggtitle("Association between rs2887399 and singletons\nstratified by clone size quartile") +
+        facet_wrap(~VAF_quartile, nrow = 1)
+```

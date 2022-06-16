@@ -12,6 +12,10 @@ fitness estimates.
 ## PACER-HB
 See [here](model_clone_growth.Rmd) for PACER-HB development and analyses. 
 
+## Finemapping the TCL1A locus
+See [here](finemapping_tcl1a.Rmd) for our analysis that performs finemapping
+of the TCL1A locus using SuSIE. 
+
 ## Data availability
 Please see the data availability statement in the paper. The data required to 
 reproduce these analysis is available through dbGaP. 
