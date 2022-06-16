@@ -1,0 +1,461 @@
+---
+title: "Evaluation of Clonal Expansion Estimates in WHI"
+author:
+  - name: Josh Weinstock
+date: "`r Sys.Date()`"
+output: 
+    distill::distill_article:
+        toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
+
+library("tidyverse")
+library("glue")
+library("rmarkdown")
+library("rstan")
+library("loo")
+
+estimated_expansion = data.table::fread("../output/csv/estimated_clone_expansions_encore_2020_09_02.tsv") %>% 
+    as_tibble %>%
+    #select(NWD_ID, mean_clone_birth, mean_clone_fitness, counts, chip_driver_gene, age)
+    select(NWD_ID, mean_clone_fitness = mean, counts, chip_driver_gene, age)
+
+observed_expansion = data.table::fread("../input/whi_lls_timepoints_073020.txt") %>% 
+    as_tibble %>%
+    select(
+        NWD_ID = NWDID, 
+        dVAFdT, 
+        VAF1 = VAF_whi,
+        VAF2 = VAF_LLS,
+        Age1 = WHI_drawAge,
+        Age2 = LLS_drawAge,
+        num_mut_wgs,
+        mutation_group = group
+    ) # VAF is from TOPMed WGS, VAF1 and VAF2 are from Amplicon
+
+observed_expansion_ = observed_expansion
+
+inferred_clones = readRDS(file.path("../output", "rds", "inferred_number_of_clones_2020_10_15.rds")) %>%
+    select(NWD_ID, inferred_clones = mean_clusters)
+
+theme_set(cowplot::theme_cowplot(font_size = 15))
+```
+## Data Filtering and processing
+
+```{r, echo = TRUE}
+#observed_expansion = observed_expansion %>%
+#    dplyr::filter((VAF2 - VAF1) >= -.05 & !is.na(dVAFdT) & VAF1 <= .4)
+
+observed_expansion = observed_expansion %>%
+    dplyr::filter(!is.na(dVAFdT) & VAF1 <= .4) %>%
+    dplyr::filter(mutation_group %in% c("strict", "moderate")) %>%
+    mutate(dVAFdT = pmax(0, dVAFdT)) # truncate at 0!
+
+dfm = observed_expansion %>% 
+    inner_join(estimated_expansion) %>%
+    inner_join(inferred_clones)
+```
+
+## Singleton counts performance
+
+```{r}
+inverse_normalize = function(x) {
+        qnorm(rank(x, na.last = "keep") / (sum(!is.na(x)) + 1))
+}
+
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    ggplot(data = ., aes(x = counts, y = dVAFdT)) +
+        geom_point() +
+        labs(x = "passengers", y = "dVAFdT")
+
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    ggplot(data = ., aes(x = counts, y = dVAFdT, color = chip_driver_gene)) +
+        geom_point() +
+        labs(x = "passengers", y = "dVAFdT", color = "mutated CHIP gene")
+
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    lm(inverse_normalize(dVAFdT) ~ counts, data = .) %>%
+    summary
+```
+
+## Residualized singleton counts performance
+
+Here we residualize on age and VAF1. 
+
+```{r}
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    drop_na(VAF1, age) %>%
+    mutate(resids = residuals(lm(counts ~ VAF1 + age))) %>%
+    ggplot(data = ., aes(x = resids, y = dVAFdT)) +
+        geom_point() +
+        labs(x = "residualized passengers", y = "dVAFdT")
+
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    drop_na(VAF1, age) %>%
+    mutate(resids = residuals(lm(counts ~ VAF1 + age))) %>%
+    lm(inverse_normalize(dVAFdT) ~ resids, data = .) %>%
+    summary
+```
+
+## Summary table
+
+```{r summary_table}
+models = tibble(
+            predictors = c(
+                "counts",
+                "age",
+                "VAF1",
+                "counts + age",
+                "counts + age + VAF1"
+            )
+        ) %>%
+        mutate(
+            formula = glue("inverse_normalize(dVAFdT) ~ {predictors}"),
+            models = map(formula, ~lm(as.formula(.x), data = dfm)),
+            glance = map(models, broom::glance),
+            tidy = map(models, broom::tidy),
+            passenger_pvalue = map2_dbl(tidy, predictors, function(m, p) {
+                if(stringr::str_detect(p, "counts")) {
+                   m %>%
+                        dplyr::filter(term == "counts") %>%
+                        dplyr::pull(p.value)
+                } else {
+                    return(NA)
+                }
+            }),
+            Covariates = c(
+                "passengers", 
+                "age",
+                "VAF",
+                "passengers and age",
+                "passengers, age, and VAF"
+            )
+        )
+
+models %>%
+    tidyr::unnest(glance) %>%
+    select(
+        Covariates, 
+        `Rsq(%)` = r.squared,
+        `Adjusted-Rsq(%)` = adj.r.squared,
+        AIC,
+        `Passengers pvalue` = passenger_pvalue
+    )  %>%
+    gt::gt() %>%
+    gt::fmt_percent(columns = vars(`Rsq(%)`, `Adjusted-Rsq(%)`), decimals = 1) %>%
+    gt::fmt_number(columns = vars(AIC), decimals = 1) %>%
+    gt::fmt_scientific(columns = vars(`Passengers pvalue`), decimals = 2)
+
+```
+
+### Stratify by age
+```{r strat_age}
+median_age = median(dfm$age)
+
+older_model = dfm %>%
+    dplyr::filter(age > median_age) %>%
+    rsample::bootstraps(times = 100) %>%
+    dplyr::mutate(
+        model = purrr::map(splits, ~lm(inverse_normalize(dVAFdT) ~ age + VAF1 + counts, data = .x)),
+        rsq = purrr::map_dbl(model, ~pluck(summary(.x), "adj.r.squared"))
+    )
+
+print("mean of older_model Rsq")
+older_model %>%
+    dplyr::pull(rsq) %>%
+    mean
+
+older_model %>%
+    dplyr::pull(rsq) %>%
+    quantile(probs = c(.025, .975))
+
+print("mean of younger_model Rsq")
+
+younger_model = dfm %>%
+    dplyr::filter(age <= median_age) %>%
+    rsample::bootstraps(times = 100) %>%
+    dplyr::mutate(
+        model = purrr::map(splits, ~lm(inverse_normalize(dVAFdT) ~ age + VAF1 + counts, data = .x)),
+        rsq = purrr::map_dbl(model, ~pluck(summary(.x), "adj.r.squared"))
+    )
+
+younger_model %>%
+    dplyr::pull(rsq) %>%
+    mean
+
+younger_model %>%
+    dplyr::pull(rsq) %>%
+    quantile(probs = c(.025, .975))
+
+ggplot(data = dfm, aes(x = age)) +
+    geom_histogram() + 
+    cowplot::theme_cowplot(font_size = 12)
+```
+
+```{r resid}
+resid_plotter = function(model, data, var, var_label) {
+    data = data %>%
+        mutate(resid = residuals(model))
+
+    plot = ggplot(data = data, aes_string(x = var, y = "resid")) +
+                    geom_point() +
+                    cowplot::theme_cowplot(font_size = 12) + 
+                    geom_smooth(se = FALSE) + 
+                    labs(y = "Residuals", x = var_label)
+
+    plot
+}
+
+models %>%
+    dplyr::filter(predictors == "counts + age + VAF1") %>%
+    dplyr::pull(models) %>%
+    pluck(1) %>%
+    resid_plotter(dfm, "counts", "Passengers")
+
+models %>%
+    dplyr::filter(predictors == "counts + age + VAF1") %>%
+    dplyr::pull(models) %>%
+    pluck(1) %>%
+    resid_plotter(dfm, "age", "Age at blood draw")
+
+models %>%
+    dplyr::filter(predictors == "counts + age + VAF1") %>%
+    dplyr::pull(models) %>%
+    pluck(1) %>%
+    resid_plotter(dfm, "counts", "Passengers")
+
+models %>%
+    dplyr::filter(predictors == "counts + age + VAF1") %>%
+    dplyr::pull(models) %>%
+    pluck(1) %>%
+    resid_plotter(dfm, "VAF1", "Variant allele fraction")
+
+```
+
+## PACER-HB measure performance
+
+```{r}
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    ggplot(data = ., aes(x = exp(mean_clone_fitness), y = dVAFdT)) +
+        geom_point() +
+        labs(x = "exp(clone fitness)", y = "dVAFdT")
+
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    lm(inverse_normalize(dVAFdT) ~ exp(mean_clone_fitness), data = .) %>%
+    summary
+
+#estimated_expansion %>%
+#    inner_join(observed_expansion) %>%
+#    lm(inverse_normalize(dVAFdT) ~ exp(mean_clone_fitness) + mean_clone_birth, data = .) %>%
+#    summary
+```
+
+## Residualized derived measure performance
+
+Here we residualize on age and VAF1. 
+
+```{r}
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    drop_na(VAF1, age) %>%
+    mutate(resids = residuals(lm(mean_clone_fitness ~ VAF1 + age))) %>%
+    ggplot(data = ., aes(x = resids, y = dVAFdT)) +
+        geom_point() +
+        labs(x = "residualized derived measure", y = "dVAFdT")
+
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    drop_na(VAF1, age) %>%
+    mutate(resids = residuals(lm(mean_clone_fitness ~ VAF1 + age))) %>%
+    lm(inverse_normalize(dVAFdT) ~ resids, data = .) %>%
+    summary
+```
+
+## Comparison between counts and derived measure
+
+```{r}
+estimated_expansion %>%
+    inner_join(observed_expansion) %>%
+    drop_na(VAF1, age) %>%
+    ggplot(data = ., aes(x = exp(mean_clone_fitness), y = counts)) +
+        geom_point() +
+        labs(x = "exp(clone fitness)", y = "counts")
+```
+
+
+```{r, eval = FALSE}
+stan_code = "
+data {
+    int<lower=0> N;
+    int<lower=0> T;
+    real y[N, T];
+    real fitness[N];
+    real ts[N, T];
+    real<lower=0> y0;
+}
+parameters {
+    real<lower=0> alpha;
+    real<lower=0> beta;
+    real<lower=0> sigma;
+}
+transformed parameters {
+    real y_hat[N, T];
+    for(t in 1:T) {
+        for(i in 1:N) {
+            y_hat[i, t] = y0 * exp(alpha * exp(fitness[i]) * (1.0 - exp(-beta * ts[i, t])) / beta);
+        }
+    }
+}
+model {
+    sigma ~ normal(.1, .1);
+    alpha ~ normal(.5, .5);
+    beta ~ normal(.1, 1);
+    for(t in 1:T) {
+        for(i in 1:N) {
+            // y[i, t] ~ normal(y_hat[i, t], sigma);
+            y[i, t] ~ student_t(5, y_hat[i, t], sigma);
+        }
+    }
+}
+generated quantities{
+    real y_rep[N, T];
+    vector[N] log_lik;
+    for(t in 1:T) {
+        for(i in 1:N) {
+         //   y_rep[i, t] = normal_rng(y_hat[i, t], sigma);
+            y_rep[i, t] = student_t_rng(5, y_hat[i, t], sigma);
+         //   log_lik[i] = normal_lpdf(y[i, t] | y_hat[i, t], sigma);
+            log_lik[i] = student_t_lpdf(y[i, t] | 5, y_hat[i, t], sigma);
+        }
+    }
+}
+"
+
+make_data_stan = function(dfm) {
+    list(
+        N = nrow(dfm),
+        T = 2,
+        y = dfm %>% select(VAF1, VAF2) %>% as.matrix,
+        fitness = dfm$mean_clone_fitness,
+        #ts = dfm %>% mutate(t1 = Age1 - mean_clone_birth, t2 = Age2 - mean_clone_birth) %>% select(t1, t2) %>% as.matrix,
+        ts = dfm %>% mutate(t1 = Age1 * 1 - 20, t2 = Age2 * 1 - 20) %>% select(t1, t2) %>% as.matrix,
+        y0 = .01
+    )
+}
+
+run_model = function(dfm) {
+
+    data_stan = make_data_stan(dfm)
+    
+    model = stan(
+        model_code = stan_code,
+        model_name = "growth_process",
+        data = data_stan,
+        chains = 5, iter = 1000, cores = 5
+    )
+    model
+}
+
+# model = run_model(dfm)
+```
+## Gompertz model
+
+We use a Gompertz growth model to describe the clonal trajectory as a continuous function of time. 
+The model assumes the following form:
+
+$$ \frac{dVAF}{dT} = VAF_{0}\alpha e^{-\beta t} $$
+
+Where $t$ is the time since the acquisition of the driver mutation. $VAF_{0}$ is the initial
+size of the clone, which we set to $.01$. $\alpha$ is the initial proliferation rate
+of the clone, which we set equal to $\psi e^{fitness}$. The $fitness$ parameter is same as the one above.
+$\beta$ is the decay of the proliferation rate over time, i.e., a parameter for 
+the "saturation" rate of the clone. Substituting in the fitness parameter for $\alpha$, we get:
+
+$$ \frac{dVAF}{dT} = VAF_{0}\psi e^{fitness} e^{-\beta t} $$
+
+The above equation describes the change in VAF over time. We can solve the equation to obtain an
+explict form for the value of VAF over time (rather than the change of VAF). This is:
+
+$$  VAF(t) = VAF_{0} e^{ \frac{\alpha}{\beta}(1 - e^{-\beta t})} $$
+
+```{r, eval = FALSE}
+#model = run_model(dfm)
+pars = rstan::summary(model)$summary %>% as_tibble(rownames = "par")
+mean_alpha = pars %>% dplyr::filter(par == "alpha") %>% dplyr::pull(mean)
+mean_beta = pars %>% dplyr::filter(par == "beta") %>% dplyr::pull(mean)
+y_hat = pars %>% dplyr::filter(str_detect(par, "y_hat\\["))
+y_hat1 = y_hat %>% dplyr::filter(str_detect(par, ",1]")) %>% dplyr::pull(mean)
+y_hat2 = y_hat %>% dplyr::filter(str_detect(par, ",2]")) %>% dplyr::pull(mean)
+y_hat_diff = y_hat2 - y_hat1
+y_hat_rate = y_hat_diff / (dfm$Age2 * 1 - dfm$Age1 * 1)
+#y_hat_deriv = dfm$VAF1 * mean_alpha * exp(dfm$mean_clone_fitness) * exp(-mean_beta * (dfm$Age2 - dfm$mean_clone_birth))
+y_hat_deriv = dfm$VAF1 * mean_alpha * exp(dfm$mean_clone_fitness) * exp(-mean_beta * (dfm$Age1 * 1 - 20))
+y_hat_df = tibble(
+    pVAF1 = y_hat1,
+    pVAF2 = y_hat2,
+    pdVAFdT_int = y_hat_rate,
+    pdVAFdT_deriv = y_hat_deriv
+)
+```
+
+```{r, eval = FALSE}
+gompertz = function(y0, alpha, beta, fitness, time) {
+    y0 * exp(alpha * exp(fitness) * (1.0 - exp(-beta * time)) / beta);
+}
+
+plot_gompertz = function(y0, alpha, beta, fitness, max_time = 40) {
+    time = 1:max_time
+    yhat = gompertz(y0, alpha, beta, fitness, time)
+
+    plot_df = tibble(
+        time = time,
+        yhat = yhat
+    )
+
+    ggplot(plot_df, aes(x = time, y = yhat)) +
+        geom_line() +
+        ggtitle(glue("VAF trajectory over {max(time)} years\nalpha={format(alpha, digits = 2)}, beta={format(beta, digits = 2)}, fitness={format(fitness, digits = 2)}")) +
+        labs(y = "VAF(t)", x = "t")
+}
+```
+### Trajectory of high fitness clone
+
+```{r, eval = FALSE}
+plot_gompertz(.01, mean_alpha, mean_beta, .3)
+```
+
+### Trajectory of medium fitness clone
+
+```{r, eval = FALSE}
+plot_gompertz(.001, mean_alpha, mean_beta, 0)
+```
+
+### Trajectory of low fitness clone
+
+```{r, eval = FALSE}
+plot_gompertz(.001, mean_alpha, mean_beta, -.2)
+```
+
+## Predictions of the Gompertz model
+
+```{r, eval = FALSE}
+y_hat_df %>%
+    bind_cols(dfm) %>%
+    lm(inverse_normal(dVAFdT) ~ pdVAFdT_int, data = .) %>%
+    summary
+```
+```{r}
+dfm %>%
+    write_csv(glue("../output/csv/WHI_timepoint_analysis_derived_measures_appended_{date}.csv"))
+```
+

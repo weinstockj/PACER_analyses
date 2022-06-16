@@ -9,6 +9,11 @@ Rmarkdown documentation for executing these files.
 Please see [here](counts_by_gene.Rmd) for our analyses on estimating driver gene
 fitness estimates. 
 
+## PACER validation in WHI samples
+See [here](new_clonal_expansion_estimates_evaluation.Rmd) for our analysis 
+of our clonal expansion estimates in WHI carriers with multiple mutational
+assessments. 
+
 ## PACER-HB
 See [here](model_clone_growth.Rmd) for PACER-HB development and analyses. 
 
