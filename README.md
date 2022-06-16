@@ -21,7 +21,7 @@ An [renv](https://github.com/rstudio/renv) lock file is provided, which
 states the R version and packages required. 
 
 ## Notes on portability
-This analysis has only been tested on Ubuntu 18.04 with Python (>=3.6).  
+This analysis has only been tested on Ubuntu 18.04.
 
 ## License
 The appropriate license for this code is currently under consideration. 
