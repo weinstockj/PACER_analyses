@@ -23,7 +23,7 @@ library("loo")
 ```
 
 ```{r load, include=FALSE, cache=TRUE}
-Rcpp::sourceCpp("../recode_subs.cpp")
+Rcpp::sourceCpp("recode_subs.cpp")
 counts = read_csv("../output/csv/CT_TC_counts_equiv_vaf_2020_09_01.csv")
 db = read_csv("/net/topmed/incoming/study.reference/current.11.2019/nhlbi.6000.terrys.incoming.csv.gz")
 

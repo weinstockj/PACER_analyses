@@ -22,7 +22,7 @@ library("patchwork")
 library("glue")
 library("viridis")
 
-Rcpp::sourceCpp("../recode_subs.cpp")
+Rcpp::sourceCpp("recode_subs.cpp")
 theme_set(cowplot::theme_cowplot(font_size = 20))
 counts = read_csv("../output/csv/CT_TC_counts_equiv_vaf_2020_09_01.csv")
 sample_manifest = data.table::fread("../../chip_call_set/output/TOPMed_CHIPcalls_with_covariates_2020_08_31.tsv.gz") %>%
