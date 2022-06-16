@@ -1,0 +1,566 @@
+---
+title: "PACER-HB: Modeling clone growth rates from C>T + T>C counts"
+author:
+  - name: Josh Weinstock
+date: "`r Sys.Date()`"
+output: 
+    distill::distill_article:
+        toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(dev.args = list(png = list(type = "cairo")), dev = "png")
+
+library("MASS")
+library("tidyverse")
+library("ggridges")
+library("patchwork")
+library("glue")
+library("viridis")
+library("rstan")
+library("loo")
+```
+
+```{r load, include=FALSE, cache=TRUE}
+Rcpp::sourceCpp("../recode_subs.cpp")
+counts = read_csv("../output/csv/CT_TC_counts_equiv_vaf_2020_09_01.csv")
+db = read_csv("/net/topmed/incoming/study.reference/current.11.2019/nhlbi.6000.terrys.incoming.csv.gz")
+
+
+sample_manifest = data.table::fread("../input/TOPMed_CHIPcalls_with_covariates_2020_08_31.tsv.gz") %>%
+    as_tibble
+
+manifest = data.table::fread("../input/TOPMed_variant_level_CHIPcalls_with_covariates_2020_08_31.tsv") %>% 
+                as_tibble %>%
+                inner_join(
+                    sample_manifest %>% select(Sample, haschip, STUDY, n_CHIP_variants, mut_class, mut_class_mult)
+                ) %>%
+                filter(n_CHIP_variants == 1 | is.na(n_CHIP_variants)) %>%
+                rename(alt_reads = alt_AD, ref_reads = ref_AD) %>%
+                mutate(
+                    detection = map2_dbl(
+                        ref_reads, alt_reads,
+                        ~extraDistr::pbbinom(1, size = 40, alpha = .y + 1, beta = .x + 3, lower.tail = FALSE) # P(alt reads > 1) = P( at least two alt reads)
+                        #~extraDistr::pbbinom(.35 * 40, size = 40, alpha = .y + 1, beta = .x + 3, lower.tail = TRUE) - extraDistr::pbbinom(1, size = 40, alpha = .y + 1, beta = .x + 3, lower.tail = TRUE) # P(2 <= alt reads <= 14)
+                    )
+                ) %>%
+                select(Sample, STUDY, haschip, ref_reads, alt_reads, age = AgeAtBloodDraw, n_CHIP_variants, detection, mut_class, mut_class_mult)
+
+annot = data.table::fread("/net/topmed3/working/anitapan/freeze.8/freeze8_sample_annot_2019-05-30.txt") %>%
+    as_tibble
+
+counts = counts %>% 
+                left_join(
+                    annot %>%
+                        dplyr::select(NWD_ID = sample.id, seq_center, low_depth_rate = LDR, control_sample = geno.cntl)
+                ) %>%
+                left_join(sample_manifest %>% dplyr::select(NWD_ID = Sample, STUDY)) %>%
+                left_join(manifest %>% dplyr::select(-STUDY), by = c("NWD_ID" = "Sample")) %>%
+                mutate(
+                    haschip = coalesce(as.logical(haschip), FALSE),
+                    substitution = glue("{REF}>{ALT}"),
+                    equivalence_threshold = if_else(
+                            equivalence_threshold == "True" | equivalence_threshold, 
+                            "same VAF as driver", "different VAF")
+                ) %>%
+                mutate(
+                    substitution = convert_substitution(substitution)
+                ) %>%
+                filter(substitution %in% c("C>T", "T>C")) %>%
+                dplyr::select(-n) %>% # redundant with counts
+                group_by(NWD_ID, haschip, chip_driver_gene, detection, ref_reads, alt_reads, age, STUDY) %>%
+                summarize(
+                    counts = sum(counts)
+                ) %>%
+                dplyr::ungroup(.) %>%
+                dplyr::filter(!(haschip & is.na(age))) # exclude CHIP cases with NA age
+
+
+exclude_controls = function(df) {
+    df %>%
+        filter(haschip)
+}
+
+most_common_chip_drivers = counts %>%
+                            exclude_controls %>%
+                            group_by(chip_driver_gene) %>%
+                            summarize(n = length(unique(NWD_ID))) %>%
+                            filter(n > 50) %>%
+                            pull(chip_driver_gene)
+
+filter_by_driver = function(df) {
+    df %>%
+        filter(chip_driver_gene %in% most_common_chip_drivers)
+}
+
+x_chrom_drivers = c("BCOR","BCORL1", "BRCC3","KDM6A","STAG2","ZRSR2","ZBTB33")
+
+sidd_filter = function(df) {
+    df %>%
+        dplyr::filter(!(haschip & alt_reads / (alt_reads + ref_reads) > .5), (age > 40 | is.na(age))) %>%
+        dplyr::filter(!(chip_driver_gene %in% x_chrom_drivers))
+}
+```
+
+## Developing PACER-HB
+
+Here we introduce a hierarchical Bayesian model for estimating clone birth dates and clone growth sizes, derived from C>T + T>C mutation counts. 
+We account for artifacts and censoring that affect the mutation counts. The derived measure is highly
+correlated with the passenger counts, but places a greater weight on the clone size. We generally observe
+that our estimates imply JAK2=splicing>ASXl1=TET2>TP53>other>DNMT3A, but the exact ordering depends
+on which measures are used and which covariates are included. 
+
+## PACER-HB Modeling assumptions
+
+  1. We are interesting in two quantities - clone birth date, and clone growth rate.
+  2. We assume that an increase in clone birth date is additively related to the mutation count.
+  3. We assume that we have some baseline artifact rate of counts that are not related to clone birth dates.
+  4. We assume that we have the same artifact contribution in CHIP carriers and controls conditional on study. 
+  5. We model the mutation rate as unknown with a strong prior (more below). 
+  6. We assume that the counts are censored for small and large clones (more below). 
+  7. We can estimate the average growth rate of the clone if we know the age at blood draw. 
+
+### Assumption 1 and 2
+We assume that in the absence of artifacts and data censoring that we'd have
+
+$$counts_i = \mu T_i$$
+
+Where $\mu$ is the mutation rate per year and $T_i$ is the birth date of the clone (in years). 
+
+This assumption also implies that if we had no artifacts, CHIP controls would not have any mutations at 
+a detectable VAF. 
+
+### Assumptions 3 and 4
+
+In practice, we assume that the mutation counts are a mixture of artifacts and real mutations. We assume that
+CHIP controls only have artifacts. This suggests the following: 
+
+$$counts_i = \mu T_i + \alpha_s$$
+
+Where $\alpha_s$ is the artifact rate for study $s$. 
+We assume that $\alpha_s \sim N(\alpha_{global}, 10)$, implying that the study specific artifact rates are drawn
+from a N(global artifact rate, 10) distribution. This helps with studies that have few samples. 
+
+### Assumption 5
+
+We use Orosio et al. 2018 as a reference for the mutation rate. They report $14.2$ mutations per year.
+Since we are only looking at a subset of mutations (C>T + T>C), which we assume comprise 70% of the 
+true mutations, we use $9.9$ ( $=14.2 * .7$) as our prior. We place a very informative prior on 
+this value. 
+
+### Assumption 6
+
+For small clones that are at the border of our detection limit, we will miss many of their 
+passenger mutations by chance. This is because if the true clone VAF is 5% at ~50X, then
+there is ~1/3 chance that a passenger mutation will not have two alt-reads, which is necessary to appear
+in this callset. This censors the mutation counts for small clones. Censoring affects large clones as well, because we are only looking at passengers with VAF <= 35%. This will deflate the count for clones with a
+VAF near 35%. 
+
+This suggests:
+
+$$counts_i = c_i \mu T_i + \alpha_s$$
+
+Where $c_i$ is the censoring rate, which is derived from the driver variant VAF and depth. This is equivalent
+to adjusting the observing counts:
+
+$$\frac{counts_i - \alpha_s}{c_i} = \mu T_i $$
+
+```{r censoring_plot, layout="l-body-outset", fig.width = 14, fig.height = 6}
+p1 = counts %>%
+    sidd_filter %>%
+    mutate(driver_vaf = alt_reads / (alt_reads + ref_reads)) %>%
+    ggplot(data = ., aes(x = driver_vaf, y = 1 - detection)) +
+        geom_point() + 
+        labs(x = "driver VAF", y = "proportion of censored passengers") +
+        scale_x_continuous(labels = scales::percent) + 
+        scale_y_continuous(labels = scales::percent) + 
+        ggtitle("Censoring by clone size")
+        
+p2 = counts %>%
+    sidd_filter %>%
+    mutate(driver_vaf = alt_reads / (alt_reads + ref_reads)) %>%
+    ggplot(data = ., aes(x = counts, y = counts / detection, colour = driver_vaf)) +
+        geom_point() + 
+        scale_colour_gradient(low = "white", high = "black") +
+        labs(x = "observed singleton count", y = "corrected singleton count", color = "driver VAF(%)") +
+        ggtitle("Corrected singleton counts")
+
+p1 | p2
+```
+
+### Assumption 7
+
+We model the clone size as a random variable informed by the driver variant VAF and depth. We assume
+age at blood draw is known. Clone birth date is also included as a random variable. 
+
+$$growth\ rate_i = \frac{clone\ size_i}{age\ at\ blood\ draw_i - clone\ birth\ date_i}$$
+
+
+### Estimation procedure
+
+We model the counts using a bayesian negative binomial regression. Other details omitted. 
+
+### Limitations
+
+Here we estimate both the mutation rate and the birth date. Technically, we can only estimate the
+product of the two as a compound parameter. Some informative priors can help with this, but it means
+the units of the clone birth dates and growth rates are not strictly interpretable as years. 
+
+It may be better to use a constant for this value (mutations per year). 
+
+```{r stan, cache = FALSE}
+rstan_options(auto_write = TRUE)    
+
+study_lookup = function(df) {   
+    STUDY = df %>% ungroup %>% pull(STUDY) %>% unique
+    tibble::tibble(
+       STUDY, 
+       index = 1:length(STUDY)
+    )
+}
+
+collapse_data = function(df) {
+
+    df = ungroup(df)
+
+    lookup = study_lookup(df)
+
+    ret = list(
+        "y" = df$counts,
+        "chip" = if_else(df$haschip, 1, 0),
+        "chip_index" = cumsum(df$haschip),
+        "N" = nrow(df),
+        "N_cases" = sum(df$haschip),
+        "age" = df %>% mutate(age = if_else(haschip, age, 70)) %>% dplyr::pull(age), #impute 70 in controls - does not factor into likelihood for controls so it doesn't affect the model
+        "artifact_mean" = mean(df %>% filter(!haschip) %>% pull(counts) %>% mean),
+        "study_index" = df %>% dplyr::select(STUDY) %>% inner_join(lookup) %>% pull(index),
+        "N_study" = length(unique(df$STUDY))
+    )
+
+    return(ret)
+}
+
+
+run_model = function(df, n_chains = 1, iter = 1600, adapt_delta = .99) {
+    # takes about 10 minutes
+
+    data_stan = collapse_data(df)
+
+    initf1 = function(chain_id = 1) {
+        list(
+            artifact_rate = rnorm(n = data_stan$N_study, data_stan$artifact_mean, sd = 1),
+            mutation_rate = rnorm(n = 1, 2.5, sd = .001),
+            eta = rnorm(data_stan$N, 156.5, sd = 5),
+            clone_growth = rep(.005, data_stan$N_cases),
+            time_prop = rep(.7, data_stan$N_cases),  # 70% of way through life the clone appears
+            time = data_stan$age[data_stan$chip == 1] * .7,
+            chip_dispersion = rnorm(1, 4, sd = .05),
+            control_dispersion = rnorm(1, 4, sd = .05)
+        )
+    }
+
+    init_list = list(
+        initf1(), initf1(), initf1(), initf1()
+    )
+
+    model = stan(
+        model_name = "clone_growth_process",
+        file = "stan_code_growth_model_fitness.stan",
+        data = data_stan,
+        chains = n_chains, iter = iter, cores = 4,
+        init = initf1,
+        verbose = FALSE,
+        control = list(adapt_delta = adapt_delta, max_treedepth = 15)
+    )
+    model
+}
+
+get_elpd = function(model, cores = 5) {
+    llk = extract_log_lik(model, merge_chains = FALSE)
+    r_eff = relative_eff(exp(llk), cores = cores)
+    loo(llk, r_eff = r_eff, cores = 5)
+}
+```
+
+```{r summarize_stan, cache = TRUE, eval = FALSE}
+# Notes
+# With original model without fitness param, looic = 164,473.1 (1012.5), elpd_loo = -82236.6 (506.3)
+# model with fitness param,                  looic = 164,217.1 (960.9), elpd_loo = -82108.5 (480.5)
+filtered_counts = counts %>% sidd_filter
+
+set.seed(1)
+n_to_sample = 5000
+filtered_counts_sample = bind_rows(
+    filtered_counts %>% dplyr::filter(haschip),
+    filtered_counts %>% dplyr::filter(!haschip) %>% dplyr::sample_n(n_to_sample)
+)
+model = run_model(filtered_counts)
+date = stringr::str_replace_all(Sys.Date(), "-", "_")
+saveRDS(model, glue("stan_nb_{date}.rds"))
+fit_summary = rstan::summary(model)
+pars = fit_summary$summary %>% as_tibble(rownames = "par")
+```
+## Parameter estimates from the model
+
+```{r plot_estimates, cache = FALSE, eval = FALSE}
+posterior = rstan::extract(
+                model, 
+                permuted = FALSE, 
+                pars = c("mutation_rate", "chip_dispersion", "control_dispersion")
+            ) %>%
+            as.array(.)
+bayesplot::mcmc_areas(
+                posterior,
+                pars = c("mutation_rate"),
+                prob = 0.5
+            )  +
+            ggtitle("Posterior of mutation rate")
+```
+
+## Clone birth date estimates
+
+```{r plot_vals, cache = TRUE}
+theme_set(cowplot::theme_cowplot(font_size = 20))
+
+filtered_counts %>%
+    filter(haschip) %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "time\\["))) %>%
+    ggplot(data = ., aes(x = counts, y = mean)) +
+        geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`), alpha = .5, color = "gray") +
+        geom_point() + 
+        scale_x_continuous(labels = scales::comma) +
+        labs(x = "mutation counts", y = "clone birth date (years)") +
+        ggtitle("Clone birth date in CHIP carriers")
+
+filtered_counts %>%
+    filter(haschip) %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "time\\["))) %>%
+    filter(counts < 5000) %>%
+    ggplot(data = ., aes(x = counts, y = mean)) +
+        geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`), alpha = .5, color = "gray") +
+        geom_point() + 
+        scale_x_continuous(labels = scales::comma) +
+        labs(x = "mutation counts", y = "clone birth date (years)") +
+        ggtitle("Clone birth date in CHIP carriers\nexcluding outlier")
+```
+
+## fitness estimates
+
+```{r more_model_scatter_plots, cache = TRUE, fig.height = 5, fig.width = 7, eval = FALSE}
+library("ggridges")
+filtered_counts %>%
+    filter(haschip) %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "fitness"))) %>%
+    filter(counts < 5000) %>%
+    ggplot(data = ., aes(x = counts, y = `50%`)) +
+        geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`), alpha = .5, color = "gray") +
+        geom_point() + 
+        scale_x_continuous(labels = scales::comma) +
+        labs(x = "mutation counts", y = "fitness") +
+        geom_smooth(alpha = .3, se = FALSE, method = 'lm') +
+        ggtitle("Clone growth rate in CHIP carriers\nexcluding outlier")
+
+filtered_counts %>%
+    filter(haschip) %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "fitness"))) %>%
+    filter(counts < 5000 & between(age, 70, 75)) %>%
+    ggplot(data = ., aes(x = counts, y = `50%`)) +
+        geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`), alpha = .5, color = "gray") +
+        geom_point() + 
+        scale_x_continuous(labels = scales::comma) +
+        labs(x = "mutation counts", y = "fitness") +
+        geom_smooth(alpha = .3, se = FALSE, method = 'lm') +
+        ggtitle("Clone growth rate in CHIP carriers\nexcluding outlier: ages 70-75")
+        
+filtered_counts %>%
+    filter(haschip) %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "fitness"))) %>%
+    filter(counts < 5000) %>%
+    ggplot(data = ., aes(x = age, y = `50%`)) +
+        geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`), alpha = .5, color = "gray") +
+        geom_point() + 
+        scale_x_continuous(labels = scales::comma) +
+        labs(x = "age at blood draw", y = "fitness") +
+        geom_smooth(alpha = .3, se = FALSE) +
+        scale_y_continuous(trans = "log") +
+        ggtitle("Clone fitness in CHIP carriers\nexcluding outlier")
+
+
+filtered_counts_sample %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "y_rep"))) %>%
+    filter(counts < 5000) %>%
+    ggplot(data = ., aes(x = counts, y = mean, color = haschip)) +
+        geom_pointrange(aes(ymin = `2.5%`, ymax = `97.5%`, color = haschip), alpha = .1) +
+        geom_point() + 
+        scale_x_continuous(labels = scales::comma) +
+        scale_y_continuous(labels = scales::comma) +
+        labs(x = "mutation counts", y = "fitted value", color = "CHIP carrier") +
+        geom_smooth(alpha = .3, se = FALSE, method = "lm") +
+        ggtitle("Fitted values by mutation counts\nexcluding outlier")
+```
+
+```{r counts_by_gene, cache =  TRUE}
+filtered_counts %>%
+    filter(haschip) %>%
+    bind_cols(pars %>% filter(stringr::str_detect(par, "fitness"))) %>% # use median because means are a bit off due ot monte carlo error
+    filter_by_driver %>%
+    #filter(growth <= .04) %>% 
+    ggplot(data = ., aes(y = chip_driver_gene, x = mean, fill = ..quantile..)) +
+        ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 4, quantile_lines = TRUE,
+                jittered_points = TRUE,
+                position = position_points_jitter(width = 0.001, height = 0),
+                point_shape = '|', point_size = 3, point_alpha = 1, alpha = 0.7,
+        ) +
+        labs(x = "fitness", y = "") +
+        scale_fill_viridis(discrete = TRUE, name = "quartiles")
+```
+
+```{r encore_output, cache = TRUE}
+clone_fitness = pars %>% dplyr::filter(stringr::str_detect(par, "fitness")) %>%
+    dplyr::bind_cols(
+        filtered_counts %>% dplyr::filter(haschip) %>% dplyr::ungroup(.)
+    ) %>%
+    mutate(driver_vaf = alt_reads / (alt_reads + ref_reads))
+
+readr::write_tsv(
+    clone_fitness,
+    file.path("..", "output", "csv", 
+        glue::glue("estimated_clone_expansions_encore_{date}.tsv", date = stringr::str_replace_all(Sys.Date(), "-", "_"))
+    )
+)
+```
+
+
+```{r derived_analysis, cache = TRUE, results ='asis', echo = TRUE}
+relabel_genes = function(df) {
+    df %>%
+        mutate(
+            driver_vaf = alt_reads / (alt_reads + ref_reads),
+            gene_label = case_when(
+                chip_driver_gene %in% c("SF3B1", "SRSF2") ~ "splicing",
+                chip_driver_gene == "JAK2" ~ "JAK2",
+                chip_driver_gene == "DNMT3A" ~ "DNMT3A",
+                chip_driver_gene == "TET2" ~ "TET2",
+                chip_driver_gene == "TP53" ~ "TP53",
+                chip_driver_gene == "ASXL1" ~ "ASXL1",
+                TRUE ~ "other"
+            ),
+            gene_label = relevel(factor(gene_label), "DNMT3A")
+        ) 
+}
+
+```
+
+Next we regress log(counts) ~ age + STUDY + VAF
+
+```{r derived_analysis2, cache = TRUE, results ='asis'}
+clone_fitness %>%
+    relabel_genes %>%
+    lm(log(counts / detection) ~ age + STUDY + driver_vaf, data = .) %>%
+    summary %>%
+    pander:::pander.summary.lm(add.signifance.stars = TRUE)
+```
+
+Next we regress log(counts) ~ VAF + gene + STUDY
+
+```{r derived_analysis4, cache = TRUE, results ='asis'}
+clone_fitness %>%
+    relabel_genes %>%
+    lm(log(counts / detection) ~ driver_vaf + gene_label + STUDY, data = .) %>%
+    summary %>%
+    pander:::pander.summary.lm(add.signifance.stars = TRUE)
+```
+Next we regress log(counts) ~ gene + STUDY
+
+```{r derived_analysis5, cache = TRUE, results ='asis'}
+clone_fitness %>%
+    relabel_genes %>%
+    lm(log(counts / detection) ~ gene_label + STUDY, data = .) %>%
+    summary %>%
+    pander:::pander.summary.lm(add.signifance.stars = TRUE)
+```
+### Takeaways
+After conditioning on age and VAF, the driver gene only adds a little information (4% of variance).
+Age adds little variance after conditioning on the other values. Clone size is likely the biggest
+factor (reduce Rsq by 20% after being dropped).
+
+## What is the difference between the singleton counts and the estimated growths?
+
+Growth ~ counts
+
+```{r derived_analysis6, cache = TRUE, results ='asis'}
+clone_fitness %>%
+    relabel_genes %>%
+    lm(`50%` ~ I(counts / detection), data = .) %>%
+    summary %>%
+    pander:::pander.summary.lm(add.signifance.stars = TRUE)
+```
+
+Growth ~ counts + driver_vaf
+
+
+## What is the difference between the growth estimates and residuals from log count regression?
+
+We do both linear regression and a non-parametric analysis of the ranks, necessitated by the presence
+of a large outlier. 
+
+```{r derived_analysis9, cache = TRUE, results ='asis', echo=TRUE}
+clone_fitness %>%
+    relabel_genes %>%
+    lm(I(counts / detection) ~ driver_vaf + age + STUDY, data = .) %>%
+    residuals -> log_linear_residuals
+
+resid_df = tibble(
+    residuals = log_linear_residuals,
+    `50%` = clone_fitness$`50%`
+) 
+
+resid_df %>%
+    lm(`50%` ~ residuals, data = .) %>%
+    summary %>%
+    pander:::pander.summary.lm(add.signifance.stars = TRUE)
+
+resid_df %>%
+    lm(rank(`50%`) ~ rank(residuals), data = .) %>%
+    summary %>%
+    pander:::pander.summary.lm(add.signifance.stars = TRUE)
+
+ggplot(data = resid_df, aes(x = `50%`, y = residuals)) +
+    geom_point() +
+    labs(x = "estimated clone growth", y = "residuals")
+```
+
+```{r output_full_param_dump}
+clone_fitness = pars %>% 
+    dplyr::filter(stringr::str_detect(par, "fitness")) %>%
+    dplyr::select(
+        mean_clone_fitness = mean,
+        median_clone_fitness = `50%`,
+        sd_clone_fitness = sd
+    )
+
+clone_births = pars %>% 
+    dplyr::filter(stringr::str_detect(par, "time\\[")) %>%
+    dplyr::select(
+        mean_clone_birth = mean,
+        median_clone_birth = `50%`,
+        sd_clone_birth = sd
+    )
+
+summarized_params = filtered_counts %>% 
+    dplyr::filter(haschip) %>% 
+    dplyr::ungroup(.) %>%
+    dplyr::bind_cols(
+        clone_fitness,
+        clone_births
+    )
+
+readr::write_tsv(
+    summarized_params,
+    file.path("..", "output", "csv", 
+        glue::glue("estimated_clone_expansions_and_clone_births_{date}.tsv", date = stringr::str_replace_all(Sys.Date(), "-", "_"))
+    )
+)
+```

@@ -1,0 +1,428 @@
+---
+title: "Counts of C>T and T>C mutations by driver gene"
+author:
+  - name: Josh Weinstock
+date: "`r Sys.Date()`"
+output: 
+    distill::distill_article:
+        toc: true
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
+```
+
+
+```{r load_data}
+library("MASS")
+library("tidyverse")
+library("ggridges")
+library("patchwork")
+library("glue")
+library("viridis")
+
+Rcpp::sourceCpp("../recode_subs.cpp")
+theme_set(cowplot::theme_cowplot(font_size = 20))
+counts = read_csv("../output/csv/CT_TC_counts_equiv_vaf_2020_09_01.csv")
+sample_manifest = data.table::fread("../../chip_call_set/output/TOPMed_CHIPcalls_with_covariates_2020_08_31.tsv.gz") %>%
+    as_tibble
+
+variant_manifest = data.table::fread("../../chip_call_set/output/TOPMed_variant_level_CHIPcalls_with_covariates_2020_08_31.tsv") %>% 
+    as_tibble %>%
+    mutate(
+        CHROM = recode(CHROM, `chrchr20` = "chr20", `chrchr2` = "chr2"),
+        is_r882 = if_else(CHROM == "chr2" & POS %in% c(25234373, 25234374), TRUE, FALSE),
+        Gene = case_when(
+            is_r882 ~ "DNMT3A R882+",
+            !is_r882 & Gene == "DNMT3A" ~ "DNMT3A R882-",
+            TRUE ~ Gene
+        )
+    )
+
+#annot = data.table::fread("/net/topmed3/working/anitapan/freeze.8/freeze8_sample_annot_2019-05-30.txt") %>%
+annot = data.table::fread("/net/topmed2/working/jweinstk/exchange_area/freeze8/81411/topmed-dcc/exchange/phs000954_TOPMed_WGS_CFS/Combined_Study_Data/Genotypes/freeze.8/sample_annotation/sample_sets_2020-07-07/freeze8_sample_annot_2020-07-07.txt") %>%
+    as_tibble
+
+counts = counts %>% 
+            left_join(
+                annot %>%
+                    dplyr::select(NWD_ID = sample.id, seq_center, low_depth_rate = LDR, control_sample = geno.cntl)
+            ) %>%
+            inner_join(
+                sample_manifest %>%
+                    dplyr::select(NWD_ID = Sample, STUDY, haschip, n_CHIP_variants, mut_class, mut_class_mult, VB_DEPTH, age = AgeAtBloodDraw),
+            ) %>%
+            mutate(
+                substitution = glue("{REF}>{ALT}"),
+                equivalence_threshold = if_else(
+                        equivalence_threshold == "True", "same VAF as driver", "different VAF")
+            ) %>%
+            mutate(
+                substitution = convert_substitution(substitution)
+            ) %>%
+            filter(substitution %in% c("C>T", "T>C")) %>%
+            dplyr::select(-n) %>% # redundant with counts
+            group_by(NWD_ID, STUDY, haschip, n_CHIP_variants, chip_driver_gene, chip_driver_VAF, equivalence_threshold, age, mut_class, mut_class_mult, VB_DEPTH) %>%
+            summarize(
+                counts = sum(counts) ## sum T>C and C>T counts
+            ) %>%
+            ungroup
+
+exclude_controls = function(df) {
+    df %>%
+        filter(haschip == 1)
+}
+
+exclude_samples_with_multiple_drivers = function(df) {
+    df %>%
+        filter(n_CHIP_variants == 1 | is.na(n_CHIP_variants))
+}
+
+most_common_chip_drivers = variant_manifest %>%
+                            count(Gene) %>%
+                            filter(n > 50) %>%
+                            pull(Gene)
+
+filter_by_driver = function(df) {
+    df %>%
+        filter(chip_driver_gene %in% most_common_chip_drivers)
+}
+```
+
+## C>T + T>C counts by gene
+
+Below are density plots of C>T + T>C counts stratified by gene. The vertical lines indicate 
+the four quartiles. The small hash marks indicate the data points. 
+
+```{r plot, cache = FALSE, fig.height = 9, fig.width = 8}
+theme_set(cowplot::theme_cowplot(font_size = 20))
+p1 = counts %>%
+    exclude_controls %>%
+    exclude_samples_with_multiple_drivers %>%
+    filter_by_driver %>%    
+    #group_by(NWD_ID, chip_driver_gene) %>%
+    #summarize(
+    #   counts = sum(counts) # collapse across equiv threshold 
+    #) %>%
+    #ungroup %>%
+    #filter(counts < 1200) %>%
+    ggplot(data = ., aes(y = chip_driver_gene, x = log2(counts), fill = factor(stat(quantile)))) + 
+        #ggbeeswarm::geom_beeswarm() +
+        #geom_dotplot(binaxis = "y", stackdir = "center") +
+        #ggridges::geom_density_ridges(jittered_points = TRUE) + 
+        ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 4, quantile_lines = TRUE,
+                jittered_points = TRUE,
+                position = position_points_jitter(width = 0.05, height = 0),
+                point_shape = '|', point_size = 3, point_alpha = 1, alpha = 0.7,
+        ) +  
+        cowplot::background_grid() +
+        labs(y = "", x = "C>T + T>C mutations") +
+        #scale_x_continuous(labels = scales::comma, limits = c(0, 1000)) +
+        scale_fill_viridis(discrete = TRUE, name = "quartiles")
+
+p1
+
+counts %>%
+    exclude_controls %>%
+    #group_by(NWD_ID, chip_driver_gene) %>%
+    #summarize(
+    #   counts = sum(counts) # collapse across equiv threshold 
+    #) %>%
+    #ungroup %>%
+    #filter(counts < 1200) %>%
+    ggplot(data = ., aes(y = factor(mut_class_mult), x = log2(counts), fill = factor(stat(quantile)))) + 
+        #ggbeeswarm::geom_beeswarm() +
+        #geom_dotplot(binaxis = "y", stackdir = "center") +
+        #ggridges::geom_density_ridges(jittered_points = TRUE) + 
+        ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 4, quantile_lines = TRUE,
+                jittered_points = TRUE,
+                position = position_points_jitter(width = 0.05, height = 0),
+                point_shape = '|', point_size = 3, point_alpha = 1, alpha = 0.7,
+        ) +  
+        cowplot::background_grid() +
+        labs(y = "", x = "C>T + T>C mutations") +
+        #scale_x_continuous(labels = scales::comma, limits = c(0, 1000)) +
+        scale_fill_viridis(discrete = TRUE, name = "quartiles")
+```
+## C>T + T>C counts by gene stratified by VAF filter
+
+The same plot as above, stratified by the binomial VAF filter on the individual mutations. 
+
+```{r plot2, cache = TRUE, fig.height = 14, fig.width = 9, eval = FALSE}
+theme_set(cowplot::theme_cowplot(font_size = 20))
+p2 = counts %>%
+    exclude_controls %>%
+    exclude_samples_with_multiple_drivers %>%
+    filter_by_driver %>%
+    filter(counts < 600) %>%
+    ggplot(data = ., aes(y = chip_driver_gene, x = counts, fill = ..quantile..)) + 
+        #ggbeeswarm::geom_beeswarm() +
+        #geom_dotplot(binaxis = "y", stackdir = "center") +
+        #ggridges::geom_density_ridges(jittered_points = TRUE) + 
+        cowplot::background_grid() +
+        labs(y = "", x = "C>T + T>C mutations") +
+        scale_x_continuous(labels = scales::comma, limits = c(0, 600)) +
+        facet_grid(vars(equivalence_threshold))  +
+        ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 4, quantile_lines = TRUE,
+                jittered_points = TRUE,
+                position = position_points_jitter(width = 0.05, height = 0),
+                point_shape = '|', point_size = 3, point_alpha = 1, alpha = 0.7,
+        ) +
+        scale_fill_viridis(discrete = TRUE, name = "quartiles")
+p2
+```
+
+```{r summary, cache = TRUE, layout = "l-body-outset"}
+summary_stats = function(data, indices, f) {
+    d = data[indices]
+    return(f(d, na.rm = TRUE))
+}
+
+#counts %>% 
+#    exclude_controls %>%
+#    filter_by_driver %>%
+#    group_by(chip_driver_gene) %>%
+#    nest %>%
+#    mutate(
+#        cases = map_int(data, ~length(unique(.x$NWD_ID))),
+#        boot_median = map(data, ~boot(.x$counts, summary_stats, R = 10000, f = median)),
+#        boot_ci = map(boot_median, ~boot.ci(.x, type = "bca")),
+#        lower = map_dbl(boot_ci, ~.x$bca[1, 4]),
+#        upper = map_dbl(boot_ci, ~.x$bca[1, 5]),
+#        CI = glue("({round(lower, 3)}, {round(upper, 3)})")
+#    ) -> summarized_values_by_gene
+#
+#summarized_values_by_gene %>%
+#    dplyr::select(
+#        gene = chip_driver_gene,
+#        cases,
+#        median = boot_median,
+#        `CI 95%` = CI
+#    ) %>%
+#    arrange(desc(median)) %>%
+#    paged_table(options = list(rows.print = 20))
+```
+```{r write_results, cache = TRUE}
+#output = file.path("../output", "csv", "summarized_ct_tc_counts_11_20_19.csv")
+#
+#write_csv(
+#    counts %>% 
+#        exclude_controls %>%
+#        dplyr::select(
+#            NWD_ID, 
+#            equivalence_threshold, 
+#            `C>T+T>C count` = counts),
+#    path = output
+#)
+#
+#output = file.path("../output", "csv", "summarized_ct_tc_counts_11_20_19_encore.csv")
+#
+#write_csv(
+#    counts %>% 
+#        group_by(NWD_ID) %>%
+#        summarize(counts = sum(counts)) %>%
+#        inner_join(
+#            age %>%
+#                group_by(NWD_ID) %>%
+#                summarize(age = max(age))
+#        ) %>% 
+#        mutate(age = age - mean(age),
+#               age_squared = age ^ 2) %>%
+#        dplyr::select(
+#            NWD_ID, 
+#            age,
+#            age_squared,
+#            `C>T+T>C count` = counts),
+#    path = output
+#)
+```
+
+## Compared to DNMT3A, which driver genes have greater or fewer passenger mutations?
+
+Here we examine when compared to DNMT3A, which driver genes have significant deviations (in either direction)
+in terms of passenger counts. Here we only display deviations significant at  p < .01.  
+
+Here we use a negative binomial regression. This means the coefficients are interpreted as relative increases
+or decreases in counts. E.g., A value of 1.38 for JAK2 below means an increase in passenger mutations
+of 38% relative to ASXL1. 
+
+```{r reg, fig.height = 7, fig.width = 7, cache = FALSE, dpi = 300}
+counts_nb_results = counts %>%
+    exclude_controls %>%
+    exclude_samples_with_multiple_drivers %>%
+    group_by(chip_driver_gene) %>%
+    filter(n()  >= 30) %>%
+    ungroup %>% 
+    inner_join(variant_manifest %>% select(NWD_ID = Sample, recoded_driver_gene = Gene), by = "NWD_ID") %>%
+    mutate(recoded_driver_gene = relevel(factor(recoded_driver_gene), ref = "DNMT3A R882-")) %>%
+    glm.nb(counts ~ recoded_driver_gene + age + STUDY + chip_driver_VAF, data = .) %>%
+    broom::tidy(conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(stringr::str_detect(term, "recoded_driver_gene")) %>%
+    mutate(term = str_replace(term, "recoded_driver_gene", "")) %>%
+    # filter(p.value < 1e-2 & term != "(Intercept)") %>%
+    arrange(desc(estimate))
+
+forest = ggplot(data = counts_nb_results, aes(x = fct_reorder(term, estimate), y = estimate)) +
+        geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+        coord_flip() +
+        cowplot::background_grid() +
+        geom_hline(yintercept = 1, linetype = "dashed") + 
+        scale_y_continuous(breaks = scales::pretty_breaks(n = 5)) +
+        labs(y = "Increase relative to DNMT3A R882-", x = "") 
+
+table = ggplot(data = counts_nb_results, aes(y = fct_reorder(term, estimate))) +
+            geom_text(aes(x = .5, label = scales::scientific(p.value, digits = 2))) +
+            xlim(0, 1) +
+            theme_void()
+
+p = forest + table + plot_layout(ncol = 2, widths = c(1, .2))
+print(p)
+
+# same as above, just write out to table
+counts %>%
+    exclude_controls %>%
+    exclude_samples_with_multiple_drivers %>%
+    group_by(chip_driver_gene) %>%
+    filter(n()  >= 20) %>%
+    ungroup %>% 
+    add_count(chip_driver_gene, name = "n_samples") %>%
+    inner_join(variant_manifest %>% select(NWD_ID = Sample, recoded_driver_gene = Gene), by = "NWD_ID") %>%
+    mutate(recoded_driver_gene = relevel(factor(recoded_driver_gene), ref = "DNMT3A R882-")) %>%
+    glm.nb(counts ~ recoded_driver_gene + age + STUDY + chip_driver_VAF, data = .) %>%
+    broom::tidy(conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(stringr::str_detect(term, "recoded_driver_gene")) %>%
+    mutate(term = str_replace(term, "recoded_driver_gene", "")) %>%
+    # filter(p.value < 1e-2 & term != "(Intercept)") %>%
+    arrange(desc(estimate)) %>%
+    readr::write_tsv("../output/csv/pacer_gene_fitness_estimates_supplementary_table.tsv")
+
+counts %>%
+    exclude_controls %>%
+    mutate(mut_class_mult = relevel(factor(mut_class_mult), ref = "dnmt")) %>%
+    glm.nb(counts ~ mut_class_mult, data = .) %>%
+    broom::tidy(conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(term = str_replace(term, "mut_class_mult", "")) %>%
+    filter(p.value < 1e-2 & term != "(Intercept)") %>%
+    arrange(p.value) %>%
+    ggplot(data = ., aes(x = fct_reorder(term, estimate), y = estimate)) +
+        geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+        coord_flip() +
+        cowplot::background_grid() +
+        geom_hline(yintercept = 1, linetype = "dashed") + 
+        labs(y = "increase relative to DNMT3A counts", x = "") 
+```
+
+We observe increased passenger counts for splicing factors (SRSF2 + SF3B1) and JAK2. We also
+observe decreased passenger counts for DNMT3A. 
+
+## C>T + T>C counts by CHIP driver status
+
+```{r case_plot, fig.height = 5, fig.width = 7, cache = FALSE, dpi = 300}
+counts %>%
+    exclude_samples_with_multiple_drivers %>%
+    ggplot(data = ., aes(y = as.logical(haschip), x = log2(counts), fill = factor(stat(quantile)))) +
+        #scale_x_continuous(labels = scales::comma, limits = c(0, 2000)) +
+        ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 4, quantile_lines = TRUE,
+                jittered_points = TRUE,
+                position = position_points_jitter(width = 0.05, height = 0),
+                point_shape = '|', point_size = 3, point_alpha = 1, alpha = 0.7,
+        ) +
+        cowplot::background_grid() +
+        labs(y = "CHIP carrier", x = "log2(singletons)") +
+        scale_fill_viridis(discrete = TRUE, name = "quartiles")
+        
+counts %>%
+    exclude_samples_with_multiple_drivers %>%
+    glm.nb(counts ~ haschip + age + STUDY, data = .) %>%
+    broom::tidy(conf.int = TRUE, exponentiate = TRUE) %>%
+    knitr::kable(.)
+```
+Our regression estimates that CHIP carriers have roughly 50% more passenger counts than "controls." 
+
+```{r mult, fig.height = 5, fig.width = 7, cache = FALSE, dpi = 300}
+counts %>%
+    #exclude_controls %>%
+    mutate(n_CHIP_variants = if_else(is.na(n_CHIP_variants), 0L, n_CHIP_variants)) %>%
+    add_count(n_CHIP_variants) %>%
+    filter(n > 10) %>%
+    ggplot(data = ., aes(y = as.factor(n_CHIP_variants), x = log2(counts), fill = factor(stat(quantile)))) +
+        #scale_x_continuous(labels = scales::comma, limits = c(0, 2000)) +
+        ggridges::stat_density_ridges(
+            geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 4, quantile_lines = TRUE,
+                jittered_points = TRUE,
+                position = position_points_jitter(width = 0.05, height = 0),
+                point_shape = '|', point_size = 3, point_alpha = 1, alpha = 0.7,
+        ) +
+        cowplot::background_grid() +
+        labs(y = "number of CHIP variants", x = "log2(singletons)") +
+        scale_fill_viridis(discrete = TRUE, name = "quartiles")
+```
+    
+```{r age_plot, fig.height = 5, fig.width = 7, cache = FALSE, dpi = 300, eval = TRUE}
+counts %>%
+    exclude_samples_with_multiple_drivers %>%
+    filter(!is.na(age)) %>%
+    mutate(age_group = cut(age, breaks = c(0, 40, 50, 60, 70, 80, 90, 100), right = FALSE)) %>%
+    group_by(age_group) %>%
+    summarize(
+            se_mean = sd(counts) / sqrt(n()),
+            AC = mean(counts), 
+            lower = AC - 1.96 * se_mean,
+            upper = AC + 1.96 * se_mean,
+            age = mean(age)
+        ) -> counts_by_age
+
+ggplot(data = counts_by_age) +
+        geom_pointrange(aes(x = age_group, y = AC, ymin = lower, ymax = upper)) +
+        #geom_jitter(
+        #    data = counts %>%
+        #        inner_join(
+        #            age %>%
+        #                group_by(NWD_ID) %>%
+        #                summarize(age = max(age))
+        #        ) %>% 
+        #        mutate(age_group = cut(age, breaks = c(5, 40, 50, 60, 70, 80, 90, 100))),
+        #    aes(x = age_group, y = counts),
+        #    width = 0.05, alpha = .1
+        #) +
+        labs(x = "age", y = "average number of singletons") +
+        cowplot::theme_cowplot(font_size = 17)
+```
+
+```{r age_int_plot, fig.height = 5, fig.width = 7, cache = FALSE, dpi = 300, eval = TRUE}
+counts %>%
+    exclude_samples_with_multiple_drivers %>%
+    filter(!is.na(age)) %>%
+    mutate(age_group = cut(age, breaks = c(0, 40, 50, 60, 70, 80, 90, 100), right = FALSE)) %>%
+    mutate(haschip = as.logical(haschip)) %>%
+    group_by(age_group, haschip) %>%
+    summarize(
+            se_mean = sd(counts) / sqrt(n()),
+            AC = mean(counts), 
+            lower = AC - 1.96 * se_mean,
+            upper = AC + 1.96 * se_mean,
+            age = mean(age)
+        ) -> counts_by_age_case
+
+ggplot(data = counts_by_age_case) +
+        geom_pointrange(aes(x = age_group, y = AC, ymin = lower, ymax = upper, color = haschip)) +
+        #geom_jitter(
+        #    data = counts %>%
+        #        inner_join(
+        #            age %>%
+        #                group_by(NWD_ID) %>%
+        #                summarize(age = max(age))
+        #        ) %>% 
+        #        mutate(age_group = cut(age, breaks = c(5, 40, 50, 60, 70, 80, 90, 100))),
+        #    aes(x = age_group, y = counts),
+        #    width = 0.05, alpha = .1
+        #) +
+        labs(x = "age", y = "average number of singletons", color = "CHIP carrier") +
+        cowplot::theme_cowplot(font_size = 17) +
+        theme(legend.position = "top")
+```
