@@ -5,6 +5,9 @@ For questions, contact [Josh Weinstock](jweinstk@umich.edu). The analyses were
 largely performed in [Rmarkdown](https://rmarkdown.rstudio.com/) files. Please see the 
 Rmarkdown documentation for executing these files. 
 
+For running PACER on your own data, you will first need passenger count variant calls.
+Code for our passenger count pipeline is available [here](https://github.com/weinstockj/passenger_count_variant_calling). Note that this pipeline assumes thats you have whole genome Mutect2 calls. 
+
 ## PACER gene level analyses
 Please see [here](counts_by_gene.Rmd) for our analyses on estimating driver gene
 fitness estimates. 
