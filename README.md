@@ -40,4 +40,4 @@ states the R version and packages required.
 This analysis has only been tested on Ubuntu 18.04.
 
 ## License
-The appropriate license for this code is currently under consideration. 
+This code is dual-licensed. See the [license](LICENSE.md) for further details. 
