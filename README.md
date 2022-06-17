@@ -24,6 +24,10 @@ See [here](model_clone_growth.Rmd) for PACER-HB development and analyses.
 See [here](finemapping_tcl1a.Rmd) for our analysis that performs finemapping
 of the TCL1A locus using SuSIE. 
 
+## PACER theoretical simulations
+See [here](https://github.com/weinstockj/hsc_simulation) for a repo containing
+code to run simulations of passenger count accumulation in HSCs. 
+
 ## Data availability
 Please see the data availability statement in the paper. The data required to 
 reproduce these analysis is available through dbGaP. 
