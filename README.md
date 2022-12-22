@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/501774779.svg)](https://zenodo.org/badge/latestdoi/501774779)
+
 # PACER analyses
 
 This repo contains a series of analyses that are included in [Clonal hematopoiesis is driven by aberrant activation of TCL1A](https://www.biorxiv.org/content/10.1101/2021.12.10.471810v1). 
