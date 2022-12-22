@@ -17,6 +17,9 @@ See [here](new_clonal_expansion_estimates_evaluation.Rmd) for our analysis
 of our clonal expansion estimates in WHI carriers with multiple mutational
 assessments. 
 
+## Bayesian logistic growth model in WHI
+See [here](expanded_WHI_cohort_analysis.Rmd) for our application of aBayesian logistic growth model to the WHI cohort. 
+
 ## PACER-HB
 See [here](model_clone_growth.Rmd) for PACER-HB development and analyses. 
 
