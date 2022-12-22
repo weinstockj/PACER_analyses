@@ -1,0 +1,416 @@
+---
+title: "Expanded WHI cohort analysis"
+author: "Josh Weinstock"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+## Draft text describing result
+
+Using 395 donors with clonal hematopoiesis from the Womens Health Initiative, we characterized in vivo 
+clonal expansion measured in two time points on average 16 years apart. 
+We examined the rate of clonal expansion stratified by rs2883799 genotype
+and driver mutation. Consistent with the PACER prediction, each additional
+T allele of rs2887399 subsantially reduced (-15% growth per year in TET2 carriers) the rate of clonal expansion in TET2/ASXL1/SF3B1 clones relative to those with the G/G genotype. 
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(glue)
+  library(ggplot2)
+})
+
+inverse_normalize = function(x) {
+    # rank sorts in ascending order!
+    qnorm(rank(x, na.last = "keep") / (sum(!is.na(x)) + 1))
+}
+
+df = vroom::vroom("WHI_lls_longitudinal_noblacklist_vaf005_to_40_plus_whi_original.csv")%>%
+  mutate(
+    dT = lls_age - baseline_age,
+    dVAF = vaf_lls - vaf_base,
+    dVAF = pmax(dVAF, 0), # truncate dVAFs
+    dVAFdT = dVAF / dT,
+    log1pdVAF = log1p(dVAF),
+    log1pdVAFdT = log1pdVAF / dT,
+    percent_growth_per_year = (dVAF / (vaf_base * dT))
+  ) %>%
+  mutate(
+    het = rs2887399 == 1L,
+    alt_hom = rs2887399 == 2L
+  ) %>%
+  add_count(gene, name = "gene_n") %>%
+  filter(!is.na(rs2887399)) %>% # samples are missing
+  filter(gene_n >= 5)
+
+select_genes = c(
+  "ASXL1",
+  "DNMT3A",
+  "TET2",
+  "SF3B1"
+)
+
+df = df %>%
+  dplyr::filter(gene %in% select_genes) %>%
+  dplyr::mutate(
+    gene = relevel(factor(gene), ref = "DNMT3A"),
+    gene_label = glue::glue("{gene} (N = {gene_n})"),
+    gene_label = relevel(factor(gene_label), ref = "DNMT3A (N = 253)")
+  )
+```
+
+```{r}
+df = df %>%
+  mutate(
+    dVAFdT_ivt_rescaled = inverse_normalize(dVAFdT) * sd(dVAFdT),
+    percent_growth_per_year_ivt_rescaled = inverse_normalize(percent_growth_per_year) * sd(percent_growth_per_year),
+  )
+```
+
+
+
+## dVAFdT as outcome
+
+## rs2887399 hets
+
+```{r}
+
+
+lm(
+  dVAFdT_ivt_rescaled ~ gene * het, 
+  data = 
+    df %>% 
+    dplyr::filter(rs2887399 %in% c(0, 1))
+) %>%
+  summary
+```
+
+## rs2887399 alt-homozygous carriers 
+
+```{r}
+lm(
+  dVAFdT_ivt_rescaled ~ gene + alt_hom, 
+  data = df %>% dplyr::filter(rs2887399 %in% c(0, 2))
+
+) %>%
+  summary
+```
+
+```{r}
+lm(
+  dVAFdT_ivt_rescaled ~ gene * alt_hom, 
+  data = df %>% dplyr::filter(rs2887399 %in% c(0, 2))
+
+) %>%
+  summary
+```
+## rs2887399 additive encoding
+
+```{r}
+lm(
+  dVAFdT_ivt_rescaled ~ gene * rs2887399, data = df
+) %>%
+  summary
+```
+```{r}
+plot = ggplot(data = df, aes(x = rs2887399, y = dVAFdT)) +
+  # geom_jitter(aes(x = as.numeric(rs2887399) + 1, y = percent_growth_per_year), alpha = .5) +
+  geom_boxplot(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), outlier.shape = NA) +
+  geom_jitter(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), alpha = .5) +
+  geom_smooth(aes(as.numeric(rs2887399) + 1, y = dVAFdT), method = "lm", se = FALSE) +
+  # geom_smooth(method = "lm") +
+  facet_wrap(~gene_label, nrow = 2, scales = "free_y") +
+  cowplot::theme_cowplot(font_size = 12) +
+  cowplot::panel_border()
+
+ggsave("dVAFdT.pdf", plot, width = 6, height = 4, units = "in")
+
+plot
+```
+
+## percent growth per year as outcome
+
+```{r}
+
+lm(
+  percent_growth_per_year_ivt_rescaled ~ gene * rs2887399, data = df
+) %>%
+  summary
+```
+
+
+
+```{r}
+plot = ggplot(data = df, aes(x = rs2887399, y = percent_growth_per_year)) +
+  geom_boxplot(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), outlier.shape = NA) +
+  geom_jitter(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), alpha = .5) +
+  geom_smooth(aes(as.numeric(rs2887399) + 1, y = percent_growth_per_year), method = "lm", se = FALSE) +
+  facet_wrap(~gene_label, nrow = 2, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(y = "Percent growth per year") +
+  cowplot::theme_cowplot(font_size = 12) +
+  cowplot::panel_border()
+
+ggsave("percent_growth_per_year.pdf", plot, width = 6, height = 4, units = "in")
+
+plot
+```
+```{r}
+plot = ggplot(data = df, aes(x = rs2887399, y = log1pdVAFdT)) +
+  geom_boxplot(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), outlier.shape = NA) +
+  geom_jitter(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), alpha = .5) +
+  geom_smooth(aes(as.numeric(rs2887399) + 1, y = log1pdVAFdT), method = "lm", se = FALSE) +
+  facet_wrap(~gene_label, nrow = 2, scales = "free_y") +
+  labs(y = "log(dVAF+1)/dT") +
+  cowplot::theme_cowplot(font_size = 12) +
+  cowplot::panel_border()
+
+ggsave("log1p_dVAF_dT.pdf", plot, width = 6, height = 4, units = "in")
+
+plot
+```
+
+## Logistic growth model
+
+```{r, cache=TRUE}
+df_long = df %>%
+  rename(
+    age_lls = lls_age,
+    age_base = baseline_age,
+  ) %>%
+  mutate(
+    sample_id = 1:n(),
+    is_topmed = stringr::str_detect(common_id, "NWD"),
+    dp_base = coalesce(dp_base, 38), #impute TOPMed depth to 38x
+    dp_lls = coalesce(dp_lls, median(dp_lls, na.rm = TRUE)) #Impute depth
+  ) %>%
+  select(
+    sample_id,
+    gene,
+    gene_label,
+    gene_n,
+    rs2887399,
+    vaf_base,
+    vaf_lls,
+    dp_base,
+    dp_lls,
+    age_base,
+    age_lls
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(
+      vaf_base,
+      dp_base,
+      vaf_lls,
+      dp_lls,
+      age_base,
+      age_lls
+    ),
+    names_to = c("measurement", "time"),
+    names_sep = "_",
+    values_to = c("value")
+  ) %>%
+  pivot_wider(
+    names_from = measurement,
+    values_from = value
+  ) %>%
+  mutate(
+    alt_reads = vaf * dp,
+    ref_reads = (1 - vaf) * dp
+  )
+```
+
+## Model definition
+
+```{r stan}
+stancode = '
+
+// generated with brms 2.16.3
+functions {
+  
+    real beta_binomial2_lpmf(int y, real q, real beta, int T) {
+        return beta_binomial_lpmf(y | T, beta * q / (1.0 - q), beta);
+    }
+    int beta_binomial2_rng(real q, real beta, int T) {
+        return beta_binomial_rng(T, beta * q / (1.0 - q), beta);
+    }
+
+}
+data {
+  int<lower=1> N;  // total number of observations
+  int Y[N];  // response variable
+  vector[N] VAF;
+  // data for custom integer vectors
+  int depth[N];
+  int gt[N];
+  int beta;
+  // data for group-level effects of ID gene
+  int<lower=1> N_1;  // number of grouping levels for gene
+  int<lower=1> J_1[N];  // grouping indicator per observation
+  // group-level predictor values
+  vector[N] age;
+  // data for group-level effects of sample
+  int<lower=1> N_2;  // number of grouping levels for sample ID
+  int<lower=1> J_2[N];  // grouping indicator per observation
+  int prior_only;  // should the likelihood be ignored?
+  
+
+}
+transformed data {
+}
+parameters {
+  vector[N_1] gene;  
+  vector[N_1] gene_by_gt;
+  vector[N_2] pid;  
+  vector<lower=-30,upper=0>[N_2] u;  
+  // real gt_beta;
+}
+model {
+  // likelihood including constants
+  if (!prior_only) {
+    // initialize linear predictor term
+    vector[N] q = rep_vector(0.0, N);
+    for (n in 1:N) {
+      // add more terms to the linear predictor
+      // q[n] += ( gene[J_1[n]] + gt_beta * gt[n] + gene_by_gt[J_1[n]] * gt[n] + pid[J_2[n]]) * age[n]  + u[J_2[n]];
+      q[n] += ( gene[J_1[n]] + gene_by_gt[J_1[n]] * gt[n] + pid[J_2[n]]) * age[n]  + u[J_2[n]];
+    }
+    for (n in 1:N) {
+      // apply the inverse link function
+      /* print("before ilogit q[n] = ", q[n]) */
+      q[n] = inv_logit(q[n]) * 0.5;
+      /* print("q[n] = ", q[n]) */
+    }
+    for (n in 1:N) {
+        real alpha = beta * q[n] / (1.0 - q[n]);
+        /* print("alpha = ", alpha); */
+        target += beta_binomial2_lpmf(Y[n] | q[n], beta, depth[n]);
+    }
+  }
+  // priors including constants
+  target += normal_lpdf(gene | 0.0, 0.20);
+  // target += normal_lpdf(gt_beta | 0.0, 0.05);
+  target += normal_lpdf(gene_by_gt | 0.0, 0.05);
+  target += normal_lpdf(pid | 0.0, 0.05);
+}
+generated quantities {
+    vector[N] q_new = rep_vector(0.0, N);
+    vector[N] total_effect = rep_vector(0.0, N);
+    vector[N] alpha_new = rep_vector(0.0, N);
+    vector[N] mu_new = rep_vector(0.0, N);
+    vector[N] reads_new = rep_vector(0.0, N);
+    real cor;
+    for (n in 1:N) {
+        // total_effect[n] =+ gene[J_1[n]]  + gt_beta * gt[n] + gene_by_gt[J_1[n]] * gt[n] +  pid[J_2[n]];
+        total_effect[n] =+ gene[J_1[n]] + gene_by_gt[J_1[n]] * gt[n] +  pid[J_2[n]];
+        q_new[n] += total_effect[n] * age[n]  + u[J_2[n]];
+    }
+    for (n in 1:N) {
+      // apply the inverse link function
+      q_new[n] = inv_logit(q_new[n]) * 0.5;
+      alpha_new[n] = beta * q_new[n] / (1.0 - q_new[n]);
+      mu_new[n] = alpha_new[n] / (alpha_new[n] + beta);
+      reads_new[n] = mu_new[n] * depth[n];
+    }
+
+    cor = ((1.0/N) * dot_product(mu_new, VAF) - mean(mu_new) * mean(VAF)) / (sd(VAF) * sd(mu_new));
+}
+'
+```
+
+
+```{r}
+library(rstan)
+m = stan_model(model_code = stancode)
+options(mc.cores = 2L)
+```
+## Fit model
+
+```{r}
+res = rstan::optimizing(
+  m,
+  hessian = TRUE,
+  as_vector = FALSE,
+  data = tibble::lst(
+     N = nrow(df_long),
+     Y = as.integer(df_long$alt_reads),
+     depth = as.integer(df_long$dp),
+     beta = 100L,
+     gt = df_long$rs2887399,
+     age = df_long$age,
+     N_1 = length(unique(df_long$gene)),
+     N_2 = length(unique(df_long$sample_id)),
+     J_1 = as.integer(as.factor(df_long$gene)),
+     J_2 = as.integer(as.factor(df_long$sample_id)),
+     prior_only = FALSE,
+     VAF = df_long$vaf
+  ),
+  seed = 50L,
+  tol_grad = 1e-10,
+  tol_obj = 1e-13,
+  tol_param  = 1e-10,
+  history_size = 7L,
+  init_alpha = 1e-5,
+  iter = 5000L
+)
+
+res$return_code
+res$value
+```
+
+
+```{r}
+theta_hat <- unlist(res$par)
+Hessian <- res$hessian
+
+V = solve(-Hessian)
+SE = sqrt(diag(V))
+
+```
+
+```{r}
+idx = 1:8
+
+Z = theta_hat[idx] / SE[idx]
+pvalues = 2 * pnorm(abs(Z), lower.tail = FALSE)
+
+summary = tibble::tibble(
+  term = c(
+    levels(df_long$gene),
+    glue::glue("{levels(df_long$gene)}:rs2887399")
+  ),
+  estimate = theta_hat[idx],
+  `standard error` = SE[idx],
+  `Z statistic` = Z,
+  pvalue = pvalues
+)
+
+print(summary)
+```
+
+
+```{r}
+# total effect is duplicated within each of the two time measurements
+total_effect = res$par$total_effect[seq(1, 694, by = 2)]
+
+plot = df %>%
+  mutate(total_effect = total_effect) %>%
+  mutate(total_effect_exp = exp(total_effect) - 1L) %>%
+  ggplot(data = ., aes(x = rs2887399, y = total_effect_exp)) +
+  geom_boxplot(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), outlier.shape = NA) +
+  geom_jitter(aes(x = factor(rs2887399, labels = c("G/G", "G/T", "T/T"))), alpha = .5) +
+  geom_smooth(aes(as.numeric(rs2887399) + 1, y = total_effect_exp), method = "lm", se = FALSE) +
+  # facet_wrap(~gene_label, nrow = 2, scales = "free_y") +
+  facet_wrap(~gene_label, nrow = 2) +
+  labs(y = "Percent growth per year") +
+  scale_y_continuous(labels = scales::percent) + 
+  cowplot::theme_cowplot(font_size = 12) +
+  cowplot::panel_border()
+
+ggsave("logistic_model.pdf", plot, width = 6, height = 4, units = "in")
+
+plot
+```
+
